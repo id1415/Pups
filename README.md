@@ -75,8 +75,8 @@ pip install -r requirements.txt
 Мутим Мастер-Ключ шифрования
 Чтобы ключи твоих юзеров не утекли в сеть, их надо шифровать через Fernet. Сгенерируй ключ ОДИН раз через терминал:
 
-```from cryptography.fernet import Fernet
-
+```
+from cryptography.fernet import Fernet
 master_key = Fernet.generate_key()
 print(master_key.decode())  # Вывод будет выглядеть примерно так: t-8WvV...=
 ```
