@@ -1017,7 +1017,7 @@ async def main():
     dp.message.outer_middleware(HistoryMiddleware())
     main_router.message.register(cmd_start, CommandStart())
     
-    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=0)
+    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=7)
     scheduler.start()
     
     from bot_dialogue import restore_dialogues

@@ -2,8 +2,8 @@ import os
 import json
 import asyncio
 
-from utils import get_chat_log
-from variables import PROMPT, CHAT_TRIGGER_WORD
+from utils import get_chat_log, clear_chat_log
+from variables import PROMPT, CHAT_TRIGGER_WORD, bot
 import gemini
 
 SUMMARY_CONFIG_FILE = "summary_config.json"
