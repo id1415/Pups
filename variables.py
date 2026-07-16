@@ -19,6 +19,7 @@ AIRFORCE_API_KEY = os.getenv('AIRFORCE_API_KEY')
 API_KEY_GEMINI = os.getenv('API_KEY_GEMINI')
 IMGBB_API_KEY = os.getenv('IMGBB_API_KEY')
 PUPS_BOT_TOKEN = os.getenv('PUPS_BOT_TOKEN')
+MASTER_KEY = os.getenv("MASTER_CRYPTO_KEY")
 
 session = AiohttpSession(timeout=300)
 bot = Bot(

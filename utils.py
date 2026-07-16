@@ -4,13 +4,13 @@ from datetime import datetime
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 import pytz
+from variables import MASTER_KEY
 
 load_dotenv()
 
 MEMORY_DIR = "chat_memories"
 KEYS_DIR = "user_keys"
 LOGS_DIR = "chat_logs"
-MASTER_KEY = os.getenv("MASTER_CRYPTO_KEY")
 CHAT_SETTINGS_FILE = "chat_settings.json"
 chat_settings_cache = {}
 VISION_SETTINGS_FILE = "vision_settings.json"
