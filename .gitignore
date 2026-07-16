@@ -1,0 +1,7 @@
+.env
+test.py
+*.json
+chat_logs/
+chat_memories/
+user_keys/
+__pycache__/
