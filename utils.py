@@ -30,15 +30,16 @@ def _get_fernet():
 def _get_key_path(user_id: int) -> str:
     return os.path.join(KEYS_DIR, f"{user_id}_key.json")
 
-def load_user_key(user_id: int) -> str:
-    """Загружает, расшифровывает и возвращает API-ключ пользователя."""
+def load_user_key(user_id: int, service_name: str = "airforce") -> str:
+    """Загружает, расшифровывает и возвращает API-ключ пользователя для указанного сервиса."""
     file_path = _get_key_path(user_id)
     if not os.path.exists(file_path):
         return None
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            encrypted_key = data.get("api_key")
+            # Загружаем ключ конкретного сервиса ("airforce" или "gemini")
+            encrypted_key = data.get(f"{service_name}_api_key")
             
             if not encrypted_key:
                 return None
@@ -49,34 +50,47 @@ def load_user_key(user_id: int) -> str:
             return decrypted_bytes.decode('utf-8')
             
     except Exception as e:
-        print(f"Ошибка загрузки/расшифровки ключа пользователя {user_id}: {e}")
+        print(f"Ошибка загрузки/расшифровки ключа {service_name} пользователя {user_id}: {e}")
         return None
 
-def save_user_key(user_id: int, api_key: str):
-    """Шифрует и сохраняет персональный ключ пользователя."""
+def save_user_key(user_id: int, api_key: str, service_name: str = "airforce"):
+    """Шифрует и сохраняет персональный ключ пользователя для указанного сервиса."""
     if not os.path.exists(KEYS_DIR):
         os.makedirs(KEYS_DIR)
     file_path = _get_key_path(user_id)
+    
+    # Сначала читаем текущий файл, чтобы сохранять ключи для других сервисов
+    data = {"user_id": user_id}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            pass
+
+    key_field = f"{service_name}_api_key"
+
     try:
         if api_key is None:
-            # Если ключ равен None (команда удаления), просто записываем пустую структуру или удаляем файл
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return True
-
-        # Шифруем ключ перед сохранением
-        cipher = _get_fernet()
-        encrypted_bytes = cipher.encrypt(api_key.encode())
-        encrypted_string = encrypted_bytes.decode('utf-8')
+            # Удаляем ключ конкретного сервиса
+            data.pop(key_field, None)
+            
+            # Если ключей больше нет — удаляем весь файл
+            if not any(k.endswith('_api_key') for k in data.keys()):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return True
+        else:
+            # Шифруем новый ключ
+            cipher = _get_fernet()
+            encrypted_bytes = cipher.encrypt(api_key.encode())
+            data[key_field] = encrypted_bytes.decode('utf-8')
 
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                "user_id": user_id, 
-                "api_key": encrypted_string  # В файл улетает зашифрованная абракадабра
-            }, f, ensure_ascii=False, indent=4)
+            json.dump(data, f, ensure_ascii=False, indent=4)
         return True
     except Exception as e:
-        print(f"Ошибка шифрования/сохранения ключа пользователя {user_id}: {e}")
+        print(f"Ошибка шифрования/сохранения ключа {service_name} пользователя {user_id}: {e}")
         return False
 
 def _get_memory_path(chat_id: int) -> str:

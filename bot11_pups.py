@@ -13,6 +13,7 @@ from aiogram.filters import CommandStart, Filter
 from aiogram import Dispatcher, Router, types as aiogram_types, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from google.genai import types
 from utils import (load_memory, save_memory, append_history, clear_memory,
                    load_user_key, save_user_key, 
                    get_chat_model, get_image_model, get_vision_model, get_music_model, 
@@ -21,9 +22,11 @@ from utils import (load_memory, save_memory, append_history, clear_memory,
                    get_chat_log, save_chat_log, clear_chat_log) # для функции пересказа
 from summary import is_summary_enabled, set_summary_state, process_pupps_summary, daily_summary_executor
 from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_COMMAND, PROMPT, MAX_RETRIES, RETRY_DELAY,
-                       AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot)
+                       AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI, PROMPT,
+                       client)
 import pupps_info
 import get_models_info
+from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video
 
 commands = ['нейробот инфо', 'нейробот name', 'нейробот prompt', 'нейробот chat', 'нейробот vision', 'нейробот image', 'нейробот music', 'нейробот start', 'нейробот stop', 'нейробот 0',
             'кибербот инфо', 'кибербот name', 'кибербот prompt', 'кибербот chat', 'кибербот vision', 'кибербот image', 'кибербот music', 'кибербот start', 'кибербот stop', 'кибербот 0',
@@ -133,14 +136,26 @@ def format_message_text(message: aiogram_types.Message) -> str:
     
     return f"{prefix}{user_name}: {text}".strip()
 
-async def generate_response(chat_id: int, thread_id: int, system_prompt: str, current_user_message: str, user_key: str = None) -> str:
-    return await asyncio.to_thread(
-        _sync_airforce_request,
-        chat_id,
-        thread_id,
-        system_prompt, 
-        current_user_message,
-        user_key
+async def generate_response(chat_id: int, 
+                            thread_id: int, 
+                            system_prompt: str, 
+                            current_user_message: str, 
+                            user_key: str = None, 
+                            user_id: int = None) -> str:
+    chat_model = get_chat_model(chat_id)
+    
+    if chat_model == "gemini":
+        gemini_key = user_key
+        if not gemini_key and user_id:
+            gemini_key = load_user_key(user_id, service_name="gemini")
+        return await gemini_priem(chat_id, current_user_message, user_key=gemini_key)
+    
+    return await asyncio.to_thread(_sync_airforce_request,
+                                   chat_id, 
+                                   thread_id, 
+                                   system_prompt, 
+                                   current_user_message, 
+                                   user_key
     )
 
 def _sync_airforce_request(chat_id: int, thread_id: int, system_prompt: str, current_user_message: str, user_key: str = None) -> str:
@@ -239,16 +254,28 @@ def _sync_airforce_request(chat_id: int, thread_id: int, system_prompt: str, cur
             raise RuntimeError(f"Ошибка после {MAX_RETRIES} попыток: {e}")
     raise RuntimeError("Не удалось получить ответ.")
     
-async def generate_vision_response(chat_id: int, thread_id: int, system_prompt: str, current_user_message: str, base64_image: str, user_key: str = None) -> str:
-    """Асинхронная обертка для мультимодального запроса."""
-    return await asyncio.to_thread(
-        _sync_vision_request,
-        chat_id,
-        thread_id,
-        system_prompt,
-        current_user_message,
-        base64_image,
-        user_key
+async def generate_vision_response(chat_id: int,
+                                   thread_id: int,
+                                   system_prompt: str,
+                                   current_user_message: str, 
+                                   base64_image: str, 
+                                   user_key: str = None, 
+                                   user_id: int = None) -> str:
+    vision_model = get_vision_model(chat_id)
+    
+    if vision_model == "gemini":
+        gemini_key = user_key
+        if not gemini_key and user_id:
+            gemini_key = load_user_key(user_id, service_name="gemini")
+        return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=gemini_user_key)
+        
+    return await asyncio.to_thread(_sync_vision_request, 
+                                   chat_id, 
+                                   thread_id, 
+                                   system_prompt, 
+                                   current_user_message, 
+                                   base64_image, 
+                                   user_key
     )
 
 def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, current_user_message: str, base64_image: str, user_key: str = None) -> str:
@@ -532,7 +559,7 @@ async def handle_image_generation(message: aiogram_types.Message):
     
     try:
         status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
-        detailed_prompt = await generate_response(chat_id, thread_id, PROMPT, prompt_text, user_key=user_key)
+        detailed_prompt = await generate_response(chat_id, thread_id, PROMPT, prompt_text, user_key=user_key, user_id=user_id)
         await asyncio.sleep(65)
 
         print('Генерация...')
@@ -621,6 +648,16 @@ async def handle_set_chat_model(message: aiogram_types.Message):
         
     save_chat_model(message.chat.id, chosen_model)
     await message.reply(f"✅ Успешно! Теперь в этом чате запросы отправляются в: {chosen_model}")
+    
+@main_router.message(F.text.lower() == f"{CHAT_TRIGGER_WORD} vision gemini")
+async def handle_set_vision_gemini(message: aiogram_types.Message):
+    save_vision_model(message.chat.id, "gemini")
+    await message.reply("✅ Успешно! Теперь запросы с картинками в этом чате обрабатываются через Gemini.")
+    
+@main_router.message(F.text.lower() == f"{CHAT_TRIGGER_WORD} gemini")
+async def handle_set_gemini_model(message: aiogram_types.Message):
+    save_chat_model(message.chat.id, "gemini")
+    await message.reply("✅ Успешно! Теперь в этом чате ответы генерируются через Gemini.")
     
 @main_router.message(F.text.lower().contains(f"{CHAT_TRIGGER_WORD} music"))
 async def handle_set_music_model(message: aiogram_types.Message):
@@ -712,6 +749,60 @@ async def handle_set_image_model(message: aiogram_types.Message):
     save_image_model(message.chat.id, chosen_model)
     await message.reply(f"✅ Успешно! Теперь в этом чате запросы с картинками отправляются в: {chosen_model}")
 
+@main_router.message((F.video | F.video_note), lambda m: (m.caption and CHAT_TRIGGER_WORD in m.caption.lower()) or (m.text and CHAT_TRIGGER_WORD in m.text.lower()))
+async def handle_video_vision(message: aiogram_types.Message):
+    chat_id = message.chat.id
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    user_name = message.from_user.full_name if message.from_user else "Пользователь"
+    user_id = message.from_user.id
+    gemini_user_key = load_user_key(user_id, service_name="gemini")
+    
+    # Проверяем модель
+    if get_vision_model(chat_id) != "gemini":
+        await message.reply("⚠️ Анализ видео поддерживается только моделью Gemini! Включи её командой: `пупс vision gemini`", parse_mode="Markdown")
+        return
+
+    user_text = message.caption or "Опиши, что происходит на этом видео"
+    text = f"{user_name}: {user_text}"
+
+    try:
+        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+
+        # 1. Получаем объект видео
+        video_obj = message.video or message.video_note
+        
+        # Проверка размера (Telegram Bot API не позволяет скачивать файлы > 20 МБ напрямую через бота)
+        if video_obj.file_size and video_obj.file_size > 20 * 1024 * 1024:
+            await message.reply("❌ Видео слишком большое! Telegram разрешает ботам скачивать файлы только до 20 МБ.")
+            return
+
+        # 2. Скачиваем файл
+        file = await bot.get_file(video_obj.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        
+        # 💡 ВАЖНО: Сбрасываем каретку BytesIO в начало перед чтением
+        file_bytes.seek(0)
+        raw_bytes = file_bytes.read()
+        
+        if not raw_bytes:
+            raise ValueError("Скачанный файл видео оказался пустым (0 байт).")
+
+        # 3. Кодируем в base64
+        encoded_video = base64.b64encode(raw_bytes).decode('utf-8')
+        
+        # Определяем mime_type (для video_note это обычно video/mp4)
+        mime_type = getattr(message.video, 'mime_type', None) or "video/mp4"
+
+        # 4. Отправляем в Gemini
+        response = await gemini_priem_video(chat_id, text, encoded_video, mime_type=mime_type, user_key=gemini_user_key)
+        await message.reply(response)
+
+    except Exception as e:
+        # Форматируем ошибку детально, чтобы в лог не уходила пустая строка
+        error_details = f"{type(e).__name__}: {str(e)}" if str(e) else f"Неизвестное исключение {repr(e)}"
+        print(f"❌ Ошибка в handle_video_vision: {error_details}")
+        await send_log_to_telegram(error_details, "Video Handler", chat_id, thread_id, user_name)
+
 @main_router.message(F.photo, lambda m: (m.caption and CHAT_TRIGGER_WORD in m.caption.lower()))
 async def handle_photo_vision(message: aiogram_types.Message):
     chat_id = message.chat.id
@@ -721,10 +812,10 @@ async def handle_photo_vision(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     text = f"{user_name}: {user_text}"
     
-    formatted_text = f"[Медиа] {text}"
-    memory = load_memory(chat_id)
-    updated_memory = append_history(memory, opponent_message=formatted_text)
-    save_memory(chat_id, updated_memory)
+    #formatted_text = f"[Медиа] {text}"
+    #memory = load_memory(chat_id)
+    #updated_memory = append_history(memory, opponent_message=formatted_text)
+    #save_memory(chat_id, updated_memory)
     
     user_key = load_user_key(user_id)
     
@@ -746,7 +837,8 @@ async def handle_photo_vision(message: aiogram_types.Message):
             PROMPT, 
             text, 
             encoded_image,
-            user_key
+            user_key, 
+            user_id=user_id
         )
         
         await message.reply(response)
@@ -903,7 +995,7 @@ async def monitor_all_messages(message: aiogram_types.Message):
         
         try:
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
-            response = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_key=user_key)
+            response = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_key=user_key, user_id=user_id)
             await bot.send_message(chat_id, response, message_thread_id=thread_id, reply_to_message_id=message.message_id)
         except Exception as e:
             print(f"Ошибка в ответах: {e}")
@@ -916,6 +1008,34 @@ async def monitor_all_messages(message: aiogram_types.Message):
 
 async def cmd_start(message: aiogram_types.Message):
     await message.answer(pupps_info.pupps_info, parse_mode=ParseMode.MARKDOWN_V2)
+    
+@main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey gemini'))
+async def handle_set_gemini_key(message: aiogram_types.Message):
+    user_id = message.from_user.id
+    parts = message.text.split(maxsplit=2)
+    
+    if len(parts) < 3:
+        await message.reply(
+            "🔑 Чтобы установить свой API-ключ Gemini, напиши:\n`/setkey gemini твой_api_ключ`\n\n"
+            "Чтобы удалить свой ключ, напиши:\n`/setkey gemini delete`", 
+            parse_mode="Markdown"
+        )
+        return
+        
+    user_key = parts[2].strip()
+    
+    if user_key.lower() == 'delete':
+        if save_user_key(user_id, None, service_name="gemini"):
+            await message.reply("🗑️ Твой персональный API-ключ Gemini удален. Теперь запросы будут идти через стандартный ключ бота.")
+        else:
+            await message.reply("❌ Не удалось удалить ключ.")
+        return
+
+    # Сохраняем ключ Gemini
+    if save_user_key(user_id, user_key, service_name="gemini"):
+        await message.reply(f"✅ Твой персональный API-ключ Gemini успешно сохранен в зашифрованном виде!")
+    else:
+        await message.reply("❌ Произошла ошибка при сохранении ключа.")
     
 @main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey'))
 async def handle_set_key(message: aiogram_types.Message):
@@ -1017,7 +1137,7 @@ async def main():
     dp.message.outer_middleware(HistoryMiddleware())
     main_router.message.register(cmd_start, CommandStart())
     
-    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=7)
+    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=0)
     scheduler.start()
     
     from bot_dialogue import restore_dialogues

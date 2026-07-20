@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.bot import DefaultBotProperties
+from google import genai
 
 import prompt
 
@@ -11,7 +12,7 @@ load_dotenv()
 CHAT_TRIGGER_WORD = "пупс"
 IMAGE_TRIGGER_COMMAND = "нарисуй"
 MUSIC_TRIGGER_COMMAND = 'спой'
-PROMPT = prompt.PUPPS5
+PROMPT = prompt.PUPS
 MAX_RETRIES = 30
 RETRY_DELAY = 5
 AIRFORCE_API_URL = "https://api.airforce/v1/chat/completions"
@@ -26,4 +27,8 @@ bot = Bot(
     token=PUPS_BOT_TOKEN,
     session=session,
     default=DefaultBotProperties()
+)
+
+client = genai.Client(
+    api_key=API_KEY_GEMINI,
 )
