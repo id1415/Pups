@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import BaseMiddleware
 from aiogram.filters import CommandStart, Filter
 from aiogram import Dispatcher, Router, types as aiogram_types, F
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 from aiogram.enums import ParseMode
 from google.genai import types
 from utils import (load_memory, save_memory, append_history, clear_memory,
@@ -27,6 +27,7 @@ from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_C
 import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video
+from worker import generate_image_via_worker
 
 commands = ['нейробот инфо', 'нейробот name', 'нейробот prompt', 'нейробот chat', 'нейробот vision', 'нейробот image', 'нейробот music', 'нейробот start', 'нейробот stop', 'нейробот 0',
             'кибербот инфо', 'кибербот name', 'кибербот prompt', 'кибербот chat', 'кибербот vision', 'кибербот image', 'кибербот music', 'кибербот start', 'кибербот stop', 'кибербот 0',
@@ -267,7 +268,7 @@ async def generate_vision_response(chat_id: int,
         gemini_key = user_key
         if not gemini_key and user_id:
             gemini_key = load_user_key(user_id, service_name="gemini")
-        return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=gemini_user_key)
+        return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=gemini_key)
         
     return await asyncio.to_thread(_sync_vision_request, 
                                    chat_id, 
@@ -493,6 +494,8 @@ def generate_media_sync(prompt_text, chat_id, thread_id, image_url=[], is_music=
     
     raise RuntimeError("Не удалось сгенерировать медиа после всех попыток.")
 
+from aiogram.types import BufferedInputFile
+
 @main_router.message(F.photo, lambda m: m.caption and CHAT_TRIGGER_WORD in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
 async def handle_photo_edit_request(message: aiogram_types.Message):
     chat_id = message.chat.id
@@ -506,36 +509,40 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
     user_key = load_user_key(user_id)
     
     try:
-        status_msg = await message.answer(f"⌛ Жди, {CHAT_TRIGGER_WORD.capitalize()} переделает твою картинку (может занять до 10 мин)...")
+        status_msg = await message.answer(f"⌛ Жди, {CHAT_TRIGGER_WORD.capitalize()} переделает твою картинку...")
 
+        # 1. Скачиваем изображение от пользователя
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
-        
         file_bytes_io = await bot.download_file(file.file_path)
         file_bytes = file_bytes_io.read() # Получаем чистые байты
-        imgbb_url = await asyncio.to_thread(upload_to_imgbb, file_bytes, None, chat_id, thread_id)
-        
-        if not imgbb_url:
-            raise Exception("Не удалось загрузить изображение на хостинг")
             
+        # 2. Кодируем изображение в Base64
         encoded_image = base64.b64encode(file_bytes).decode('utf-8')
 
+        # 3. Генерируем улучшенный промт через vision-модель (при необходимости)
         detailed_prompt = await generate_vision_response(chat_id, thread_id, PROMPT, prompt_text, encoded_image, user_key=user_key)
         
-        await asyncio.sleep(65)
+        # 4. Отправляем запрос напрямую в Cloudflare Worker
+        image_bytes = await generate_image_via_worker(
+            prompt_text=detailed_prompt,
+            image_b64=encoded_image,
+            aspect_ratio=aspect_ratio
+        )
         
-        path = await asyncio.to_thread(generate_media_sync, detailed_prompt, chat_id, thread_id, image_url=[imgbb_url], aspect_ratio=aspect_ratio, user_key=user_key)
-        
-        if path:
+        if image_bytes:
             print('Отправка в тг...')
-            path = upload_to_imgbb(None, path, chat_id, thread_id)
+            # Упаковываем полученные байты в файл для Telegram
+            photo_file = BufferedInputFile(image_bytes, filename="edited_image.png")
+            
             await bot.send_photo(
                 chat_id=chat_id, 
-                photo=path, 
-                message_thread_id=thread_id
+                photo=photo_file, 
+                caption=f"📝 **Промт:**\n\n`{detailed_prompt}`",
+                message_thread_id=thread_id,
+                parse_mode="Markdown"
             )
-            await message.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
-        print('Готово!')
+            print('Готово!')
 
     except Exception as e:
         print(f"Ошибка генерации: {e}")
@@ -558,23 +565,24 @@ async def handle_image_generation(message: aiogram_types.Message):
     user_key = load_user_key(user_id)
     
     try:
-        status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
+        status_msg = await message.answer("⌛ Идёт генерация картинки...")
         detailed_prompt = await generate_response(chat_id, thread_id, PROMPT, prompt_text, user_key=user_key, user_id=user_id)
-        await asyncio.sleep(65)
 
-        print('Генерация...')
+        # Передаем aspect_ratio в генерацию
+        image_bytes = await generate_image_via_worker(
+            prompt_text=detailed_prompt,
+            aspect_ratio=aspect_ratio
+        )
         
-        path = await asyncio.to_thread(generate_media_sync, detailed_prompt, chat_id, thread_id, aspect_ratio=aspect_ratio, user_key=user_key)
-        
-        if path:
-            print('Отправка в тг...')
-            path = upload_to_imgbb(None, path, chat_id, thread_id)
+        if image_bytes:
+            photo_file = BufferedInputFile(image_bytes, filename="generated_image.png")
             await bot.send_photo(
                 chat_id=chat_id, 
-                photo=path, 
-                message_thread_id=thread_id
+                photo=photo_file, 
+                caption=f"📝 **Промт:**\n\n`{detailed_prompt}`",
+                message_thread_id=thread_id,
+                parse_mode="Markdown"
             )
-            await message.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
 
         print('Готово!')
 

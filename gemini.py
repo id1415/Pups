@@ -17,6 +17,32 @@ def _get_gemini_client(user_key: str = None) -> genai.Client:
     """Возвращает клиент Gemini с пользовательским или системным ключом."""
     active_key = user_key if user_key else API_KEY_GEMINI
     return genai.Client(api_key=active_key)
+    
+async def priem_summary(prompt_text: str, user_key: str = None) -> str:
+    client = _get_gemini_client(user_key)
+    
+    config = types.GenerateContentConfig(
+        temperature=0.9,
+    )
+    
+    for attempt in range(5):
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=prompt_text,
+                config=config
+            )
+            
+            if response and response.text and response.text.strip():
+                return response.text.strip()
+                
+        except Exception as e:
+            print(f"❌ Ошибка Gemini Summary (попытка {attempt + 1}): {e}")
+            
+        if attempt < 4:
+            await asyncio.sleep(5)
+            
+    raise RuntimeError("Не удалось сгенерировать саммари.")
 
 async def priem(chat_id: int, current_user_message: str, user_key: str = None) -> str:
     client = _get_gemini_client(user_key)

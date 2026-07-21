@@ -41,7 +41,7 @@ async def process_pupps_summary(chat_id, log_data):
     )
     
     try:
-        summary = await gemini.priem(summary_system_prompt)
+        summary = await gemini.priem_summary(summary_system_prompt)
         
         await bot.send_message(
             chat_id, 
