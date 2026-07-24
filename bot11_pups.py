@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import BaseMiddleware
 from aiogram.filters import CommandStart, Filter
 from aiogram import Dispatcher, Router, types as aiogram_types, F
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message
 from aiogram.enums import ParseMode
 from google.genai import types
 from utils import (load_memory, save_memory, append_history, clear_memory,
@@ -22,12 +22,11 @@ from utils import (load_memory, save_memory, append_history, clear_memory,
                    get_chat_log, save_chat_log, clear_chat_log) # для функции пересказа
 from summary import is_summary_enabled, set_summary_state, process_pupps_summary, daily_summary_executor
 from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_COMMAND, PROMPT, MAX_RETRIES, RETRY_DELAY,
-                       AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI, PROMPT,
+                       AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI,
                        client)
 import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video
-from worker import generate_image_via_worker
 
 commands = ['нейробот инфо', 'нейробот name', 'нейробот prompt', 'нейробот chat', 'нейробот vision', 'нейробот image', 'нейробот music', 'нейробот start', 'нейробот stop', 'нейробот 0',
             'кибербот инфо', 'кибербот name', 'кибербот prompt', 'кибербот chat', 'кибербот vision', 'кибербот image', 'кибербот music', 'кибербот start', 'кибербот stop', 'кибербот 0',
@@ -60,7 +59,35 @@ def extract_aspect_ratio(text: str):
             return cleaned_text, ratio
             
     return text, "1:1"
+
+async def send_log_to_telegram(error_message: str, handler_name: str, chat_id: int, thread_id: int, user_info="Неизвестен"):
+    """Отправляет отформатированное сообщение об ошибке в отдельный лог-чат."""
+    # Экранируем обратные кавычки для Markdown
+    safe_error = str(error_message).replace('`', "'")
+    full_log_message = f'❌ {user_info}, ошибка в обработчике {handler_name}:\n\n{safe_error}'
+    
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=full_log_message
+        )
+    except Exception as e:
+        print(f"Ошибка: Не удалось отправить лог в Telegram. {e}")
         
+# Функция для определения наличия медиа и добавления префикса
+def format_message_text(message: aiogram_types.Message) -> str:
+    prefix = ""
+    # Проверяем наличие фото, видео, анимации или документа
+    if message.photo or message.video or message.animation or message.document:
+        prefix = "[Медиа] "
+    
+    # Берем текст или описание (caption)
+    text = message.text or message.caption or ""
+    user_name = message.from_user.full_name if message.from_user else "Система"
+    
+    return f"{prefix}{user_name}: {text}".strip()
+    
 def upload_to_imgbb(file_bytes, url_to_image, chat_id, thread_id):
     api_key = IMGBB_API_KEY
     url = "https://api.imgbb.com/1/upload"
@@ -109,47 +136,17 @@ def upload_to_imgbb(file_bytes, url_to_image, chat_id, thread_id):
         requests.post(tg_url, json=msg_payload)
         return url_to_image
 
-async def send_log_to_telegram(error_message: str, handler_name: str, chat_id: int, thread_id: int, user_info="Неизвестен"):
-    """Отправляет отформатированное сообщение об ошибке в отдельный лог-чат."""
-    # Экранируем обратные кавычки для Markdown
-    safe_error = str(error_message).replace('`', "'")
-    full_log_message = f'❌ {user_info}, ошибка в обработчике {handler_name}:\n\n{safe_error}'
-    
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            text=full_log_message
-        )
-    except Exception as e:
-        print(f"Ошибка: Не удалось отправить лог в Telegram. {e}")
-        
-# Функция для определения наличия медиа и добавления префикса
-def format_message_text(message: aiogram_types.Message) -> str:
-    prefix = ""
-    # Проверяем наличие фото, видео, анимации или документа
-    if message.photo or message.video or message.animation or message.document:
-        prefix = "[Медиа] "
-    
-    # Берем текст или описание (caption)
-    text = message.text or message.caption or ""
-    user_name = message.from_user.full_name if message.from_user else "Система"
-    
-    return f"{prefix}{user_name}: {text}".strip()
-
 async def generate_response(chat_id: int, 
                             thread_id: int, 
                             system_prompt: str, 
                             current_user_message: str, 
                             user_key: str = None, 
                             user_id: int = None) -> str:
+                            
     chat_model = get_chat_model(chat_id)
     
     if chat_model == "gemini":
-        gemini_key = user_key
-        if not gemini_key and user_id:
-            gemini_key = load_user_key(user_id, service_name="gemini")
-        return await gemini_priem(chat_id, current_user_message, user_key=gemini_key)
+        return await gemini_priem(chat_id, current_user_message)
     
     return await asyncio.to_thread(_sync_airforce_request,
                                    chat_id, 
@@ -265,10 +262,7 @@ async def generate_vision_response(chat_id: int,
     vision_model = get_vision_model(chat_id)
     
     if vision_model == "gemini":
-        gemini_key = user_key
-        if not gemini_key and user_id:
-            gemini_key = load_user_key(user_id, service_name="gemini")
-        return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=gemini_key)
+        return await gemini_priem_vision(chat_id, current_user_message, base64_image)
         
     return await asyncio.to_thread(_sync_vision_request, 
                                    chat_id, 
@@ -324,7 +318,6 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
                                      timeout=300)
             
             # Обработка ошибок 429/5xx
-            print(response.text)
             if response.status_code == 429 or 500 <= response.status_code < 600:
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
@@ -341,9 +334,8 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
                 if data["error"]["message"] == "This model requires an active subscription or a positive Pay-as-you-Go balance. Subscribe or top up at https://api.airforce/dashboard, or use a free model.":
                     error_paid = "Для этой модели требуется активная подписка или положительный баланс. Подпишитесь или пополните счет на сайте https://api.airforce/dashboard или воспользуйтесь бесплатной моделью."
             except Exception as e:
-                pass
+                print(e)
             
-            print(data)
             response_content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
             
             # Проверка на текстовые ошибки лимитов
@@ -494,9 +486,7 @@ def generate_media_sync(prompt_text, chat_id, thread_id, image_url=[], is_music=
     
     raise RuntimeError("Не удалось сгенерировать медиа после всех попыток.")
 
-from aiogram.types import BufferedInputFile
-
-@main_router.message(F.photo, lambda m: m.caption and CHAT_TRIGGER_WORD in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
+@main_router.message(F.photo, lambda m: m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
 async def handle_photo_edit_request(message: aiogram_types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -509,40 +499,36 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
     user_key = load_user_key(user_id)
     
     try:
-        status_msg = await message.answer(f"⌛ Жди, {CHAT_TRIGGER_WORD.capitalize()} переделает твою картинку...")
+        status_msg = await message.answer(f"⌛ Жди, {CHAT_TRIGGER_WORD.capitalize()} переделает твою картинку (может занять до 10 мин)...")
 
-        # 1. Скачиваем изображение от пользователя
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
+        
         file_bytes_io = await bot.download_file(file.file_path)
         file_bytes = file_bytes_io.read() # Получаем чистые байты
+        imgbb_url = await asyncio.to_thread(upload_to_imgbb, file_bytes, None, chat_id, thread_id)
+        
+        if not imgbb_url:
+            raise Exception("Не удалось загрузить изображение на хостинг")
             
-        # 2. Кодируем изображение в Base64
         encoded_image = base64.b64encode(file_bytes).decode('utf-8')
 
-        # 3. Генерируем улучшенный промт через vision-модель (при необходимости)
         detailed_prompt = await generate_vision_response(chat_id, thread_id, PROMPT, prompt_text, encoded_image, user_key=user_key)
         
-        # 4. Отправляем запрос напрямую в Cloudflare Worker
-        image_bytes = await generate_image_via_worker(
-            prompt_text=detailed_prompt,
-            image_b64=encoded_image,
-            aspect_ratio=aspect_ratio
-        )
+        await asyncio.sleep(65)
         
-        if image_bytes:
+        path = await asyncio.to_thread(generate_media_sync, detailed_prompt, chat_id, thread_id, image_url=[imgbb_url], aspect_ratio=aspect_ratio, user_key=user_key)
+        
+        if path:
             print('Отправка в тг...')
-            # Упаковываем полученные байты в файл для Telegram
-            photo_file = BufferedInputFile(image_bytes, filename="edited_image.png")
-            
+            path = upload_to_imgbb(None, path, chat_id, thread_id)
             await bot.send_photo(
                 chat_id=chat_id, 
-                photo=photo_file, 
-                caption=f"📝 **Промт:**\n\n`{detailed_prompt}`",
-                message_thread_id=thread_id,
-                parse_mode="Markdown"
+                photo=path, 
+                message_thread_id=thread_id
             )
-            print('Готово!')
+            await message.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
+        print('Готово!')
 
     except Exception as e:
         print(f"Ошибка генерации: {e}")
@@ -551,7 +537,7 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
         if status_msg:
             await status_msg.delete()
 
-@main_router.message(F.text, lambda m: CHAT_TRIGGER_WORD in m.text.lower() and IMAGE_TRIGGER_COMMAND in m.text.lower())
+@main_router.message(F.text, lambda m: f'{CHAT_TRIGGER_WORD}' in m.text.lower() and IMAGE_TRIGGER_COMMAND in m.text.lower())
 async def handle_image_generation(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     user_id = message.from_user.id
@@ -563,26 +549,26 @@ async def handle_image_generation(message: aiogram_types.Message):
     status_msg = None
     
     user_key = load_user_key(user_id)
+    current_image_model = get_image_model(chat_id)
     
     try:
-        status_msg = await message.answer("⌛ Идёт генерация картинки...")
+        status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
         detailed_prompt = await generate_response(chat_id, thread_id, PROMPT, prompt_text, user_key=user_key, user_id=user_id)
+        await asyncio.sleep(65)
 
-        # Передаем aspect_ratio в генерацию
-        image_bytes = await generate_image_via_worker(
-            prompt_text=detailed_prompt,
-            aspect_ratio=aspect_ratio
-        )
+        print('Генерация...')
         
-        if image_bytes:
-            photo_file = BufferedInputFile(image_bytes, filename="generated_image.png")
+        path = await asyncio.to_thread(generate_media_sync, detailed_prompt, chat_id, thread_id, aspect_ratio=aspect_ratio, user_key=user_key)
+                
+        if path:
+            print('Отправка в тг...')
+            path = upload_to_imgbb(None, path, chat_id, thread_id)
             await bot.send_photo(
                 chat_id=chat_id, 
-                photo=photo_file, 
-                caption=f"📝 **Промт:**\n\n`{detailed_prompt}`",
-                message_thread_id=thread_id,
-                parse_mode="Markdown"
+                photo=path, 
+                message_thread_id=thread_id
             )
+            await message.answer(f"📝 Промт:\n\n{detailed_prompt}")
 
         print('Готово!')
 
@@ -757,17 +743,16 @@ async def handle_set_image_model(message: aiogram_types.Message):
     save_image_model(message.chat.id, chosen_model)
     await message.reply(f"✅ Успешно! Теперь в этом чате запросы с картинками отправляются в: {chosen_model}")
 
-@main_router.message((F.video | F.video_note), lambda m: (m.caption and CHAT_TRIGGER_WORD in m.caption.lower()) or (m.text and CHAT_TRIGGER_WORD in m.text.lower()))
+@main_router.message((F.video | F.video_note), lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()) or (m.text and f'{CHAT_TRIGGER_WORD}' in m.text.lower()))
 async def handle_video_vision(message: aiogram_types.Message):
     chat_id = message.chat.id
     thread_id = message.message_thread_id if message.is_topic_message else None
     user_name = message.from_user.full_name if message.from_user else "Пользователь"
     user_id = message.from_user.id
-    gemini_user_key = load_user_key(user_id, service_name="gemini")
     
     # Проверяем модель
     if get_vision_model(chat_id) != "gemini":
-        await message.reply("⚠️ Анализ видео поддерживается только моделью Gemini! Включи её командой: `пупс vision gemini`", parse_mode="Markdown")
+        await message.reply(f"⚠️ Анализ видео поддерживается только моделью Gemini! Включи её командой: `{CHAT_TRIGGER_WORD} vision gemini`", parse_mode="Markdown")
         return
 
     user_text = message.caption or "Опиши, что происходит на этом видео"
@@ -802,8 +787,18 @@ async def handle_video_vision(message: aiogram_types.Message):
         mime_type = getattr(message.video, 'mime_type', None) or "video/mp4"
 
         # 4. Отправляем в Gemini
-        response = await gemini_priem_video(chat_id, text, encoded_video, mime_type=mime_type, user_key=gemini_user_key)
+        response = await gemini_priem_video(chat_id, text, encoded_video, mime_type=mime_type)
         await message.reply(response)
+        
+        if is_summary_enabled(chat_id):
+                bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
+                log_data = get_chat_log(chat_id)
+                log_data.append({
+                    "user": bot_name,
+                    "text": response,
+                    "time": time.strftime("%H:%M")
+                })
+                save_chat_log(chat_id, log_data)
 
     except Exception as e:
         # Форматируем ошибку детально, чтобы в лог не уходила пустая строка
@@ -811,7 +806,7 @@ async def handle_video_vision(message: aiogram_types.Message):
         print(f"❌ Ошибка в handle_video_vision: {error_details}")
         await send_log_to_telegram(error_details, "Video Handler", chat_id, thread_id, user_name)
 
-@main_router.message(F.photo, lambda m: (m.caption and CHAT_TRIGGER_WORD in m.caption.lower()))
+@main_router.message(F.photo, lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()))
 async def handle_photo_vision(message: aiogram_types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -851,6 +846,16 @@ async def handle_photo_vision(message: aiogram_types.Message):
         
         await message.reply(response)
         
+        if is_summary_enabled(chat_id):
+                bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
+                log_data = get_chat_log(chat_id)
+                log_data.append({
+                    "user": bot_name,
+                    "text": response,
+                    "time": time.strftime("%H:%M")
+                })
+                save_chat_log(chat_id, log_data)
+        
     except Exception as e:
         print(f"Ошибка в handle_photo_vision: {e}")
         user_info = message.from_user.full_name
@@ -863,7 +868,7 @@ async def handle_info(message: aiogram_types.Message):
 ### САММАРИ
 @main_router.message(
     F.text.lower().contains("вкл пересказ") & 
-    F.text.lower().contains(CHAT_TRIGGER_WORD) & 
+    F.text.lower().contains(f'{CHAT_TRIGGER_WORD}') & 
     (F.chat.type.in_({"group", "supergroup"}))  # Сработает только в группах и супергруппах
 )
 async def handle_toggle_summary_on(message: aiogram_types.Message):
@@ -880,7 +885,7 @@ async def handle_toggle_summary_on(message: aiogram_types.Message):
     else:
         await message.reply("🚫 Слышь, ты не админ!")
 
-@main_router.message(F.text.lower().contains("выкл пересказ") & F.text.lower().contains(CHAT_TRIGGER_WORD))
+@main_router.message(F.text.lower().contains("выкл пересказ") & F.text.lower().contains(f'{CHAT_TRIGGER_WORD}'))
 async def handle_toggle_summary_off(message: aiogram_types.Message):
     chat_id = message.chat.id
     is_admin = message.chat.type == "private"
@@ -910,7 +915,7 @@ async def handle_clear_memory(message: aiogram_types.Message):
 
     if is_admin:
         if clear_memory(chat_id):
-            await message.reply("🧼 Память стёрта. Я всё забыл!")
+            await message.reply("🧼 Память стёрта. Я всё забыл.")
         else:
             await message.reply("❌ Ошибка при очистке.")
     else:
@@ -930,7 +935,7 @@ class ExactWordsFilter(Filter):
         # Проверяем, что ВСЕ триггеры есть в тексте как отдельные слова
         return all(word in text_words for word in self.words)
 
-@main_router.message(ExactWordsFilter(CHAT_TRIGGER_WORD, MUSIC_TRIGGER_COMMAND))
+@main_router.message(ExactWordsFilter(f'{CHAT_TRIGGER_WORD}', MUSIC_TRIGGER_COMMAND))
 async def handle_music_generation(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     user_id = message.from_user.id
@@ -945,7 +950,7 @@ async def handle_music_generation(message: aiogram_types.Message):
     try:
         status_msg = await message.answer("⌛ Идёт генерация музыки (может занять до 10 мин)...")
         
-        user_text = user_text.replace(CHAT_TRIGGER_WORD, '').strip()
+        user_text = user_text.replace(f'{CHAT_TRIGGER_WORD}', '').strip()
         user_text = user_text.replace('спой', '').strip()
         if "style:" in user_text:
             style_part = user_text.split("style:")[1].split("lyrics:")[0]
@@ -1005,6 +1010,17 @@ async def monitor_all_messages(message: aiogram_types.Message):
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             response = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_key=user_key, user_id=user_id)
             await bot.send_message(chat_id, response, message_thread_id=thread_id, reply_to_message_id=message.message_id)
+            
+            if is_summary_enabled(chat_id):
+                bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
+                log_data = get_chat_log(chat_id)
+                log_data.append({
+                    "user": bot_name,
+                    "text": response,
+                    "time": time.strftime("%H:%M")
+                })
+                save_chat_log(chat_id, log_data)
+            
         except Exception as e:
             print(f"Ошибка в ответах: {e}")
             await send_log_to_telegram(f"{e}", "Chat", chat_id, thread_id, user_name)
@@ -1016,34 +1032,6 @@ async def monitor_all_messages(message: aiogram_types.Message):
 
 async def cmd_start(message: aiogram_types.Message):
     await message.answer(pupps_info.pupps_info, parse_mode=ParseMode.MARKDOWN_V2)
-    
-@main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey gemini'))
-async def handle_set_gemini_key(message: aiogram_types.Message):
-    user_id = message.from_user.id
-    parts = message.text.split(maxsplit=2)
-    
-    if len(parts) < 3:
-        await message.reply(
-            "🔑 Чтобы установить свой API-ключ Gemini, напиши:\n`/setkey gemini твой_api_ключ`\n\n"
-            "Чтобы удалить свой ключ, напиши:\n`/setkey gemini delete`", 
-            parse_mode="Markdown"
-        )
-        return
-        
-    user_key = parts[2].strip()
-    
-    if user_key.lower() == 'delete':
-        if save_user_key(user_id, None, service_name="gemini"):
-            await message.reply("🗑️ Твой персональный API-ключ Gemini удален. Теперь запросы будут идти через стандартный ключ бота.")
-        else:
-            await message.reply("❌ Не удалось удалить ключ.")
-        return
-
-    # Сохраняем ключ Gemini
-    if save_user_key(user_id, user_key, service_name="gemini"):
-        await message.reply(f"✅ Твой персональный API-ключ Gemini успешно сохранен в зашифрованном виде!")
-    else:
-        await message.reply("❌ Произошла ошибка при сохранении ключа.")
     
 @main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey'))
 async def handle_set_key(message: aiogram_types.Message):
@@ -1145,7 +1133,7 @@ async def main():
     dp.message.outer_middleware(HistoryMiddleware())
     main_router.message.register(cmd_start, CommandStart())
     
-    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=0)
+    scheduler.add_job(daily_summary_executor, 'cron', hour=21, minute=1)
     scheduler.start()
     
     from bot_dialogue import restore_dialogues

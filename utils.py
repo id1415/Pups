@@ -38,7 +38,6 @@ def load_user_key(user_id: int, service_name: str = "airforce") -> str:
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            # Загружаем ключ конкретного сервиса ("airforce" или "gemini")
             encrypted_key = data.get(f"{service_name}_api_key")
             
             if not encrypted_key:
@@ -155,8 +154,8 @@ def clear_memory(chat_id: int):
 def get_chat_model(chat_id: int) -> str:
     cid = str(chat_id)
     if cid in chat_settings_cache:
-        return chat_settings_cache[cid].get("model_name", "unmoderated-gpt")
-    return "unmoderated-gpt"  # Модель по умолчанию, если чата нет в базе
+        return chat_settings_cache[cid].get("model_name", "gemini")
+    return "gemini"  # Модель по умолчанию, если чата нет в базе
     
 def get_image_model(chat_id: int) -> str:
     cid = str(chat_id)
@@ -167,8 +166,8 @@ def get_image_model(chat_id: int) -> str:
 def get_vision_model(chat_id: int) -> str:
     cid = str(chat_id)
     if cid in vision_settings_cache:
-        return vision_settings_cache[cid].get("model_name", "grok-4.20-beta")
-    return "grok-4.20-beta"  # Модель по умолчанию, если чата нет в базе
+        return vision_settings_cache[cid].get("model_name", "gemini")
+    return "gemini"  # Модель по умолчанию, если чата нет в базе
     
 def get_music_model(chat_id: int) -> str:
     cid = str(chat_id)
