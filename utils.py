@@ -30,7 +30,7 @@ def _get_fernet():
 def _get_key_path(user_id: int) -> str:
     return os.path.join(KEYS_DIR, f"{user_id}_key.json")
 
-def load_user_key(user_id: int, service_name: str = "airforce") -> str:
+def load_airforce_user_key(user_id: int, service_name: str = "airforce") -> str:
     """Загружает, расшифровывает и возвращает API-ключ пользователя для указанного сервиса."""
     file_path = _get_key_path(user_id)
     if not os.path.exists(file_path):
@@ -52,7 +52,69 @@ def load_user_key(user_id: int, service_name: str = "airforce") -> str:
         print(f"Ошибка загрузки/расшифровки ключа {service_name} пользователя {user_id}: {e}")
         return None
 
-def save_user_key(user_id: int, api_key: str, service_name: str = "airforce"):
+def save_airforce_user_key(user_id: int, api_key: str, service_name: str = "airforce"):
+    """Шифрует и сохраняет персональный ключ пользователя для указанного сервиса."""
+    if not os.path.exists(KEYS_DIR):
+        os.makedirs(KEYS_DIR)
+    file_path = _get_key_path(user_id)
+    
+    # Сначала читаем текущий файл, чтобы сохранять ключи для других сервисов
+    data = {"user_id": user_id}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            pass
+
+    key_field = f"{service_name}_api_key"
+
+    try:
+        if api_key is None:
+            # Удаляем ключ конкретного сервиса
+            data.pop(key_field, None)
+            
+            # Если ключей больше нет — удаляем весь файл
+            if not any(k.endswith('_api_key') for k in data.keys()):
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return True
+        else:
+            # Шифруем новый ключ
+            cipher = _get_fernet()
+            encrypted_bytes = cipher.encrypt(api_key.encode())
+            data[key_field] = encrypted_bytes.decode('utf-8')
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+        return True
+    except Exception as e:
+        print(f"Ошибка шифрования/сохранения ключа {service_name} пользователя {user_id}: {e}")
+        return False
+        
+def load_gemini_user_key(user_id: int, service_name: str = "gemini") -> str:
+    """Загружает, расшифровывает и возвращает API-ключ пользователя для указанного сервиса."""
+    file_path = _get_key_path(user_id)
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            encrypted_key = data.get(f"{service_name}_api_key")
+            
+            if not encrypted_key:
+                return None
+                
+            # Расшифровываем
+            cipher = _get_fernet()
+            decrypted_bytes = cipher.decrypt(encrypted_key.encode())
+            return decrypted_bytes.decode('utf-8')
+            
+    except Exception as e:
+        print(f"Ошибка загрузки/расшифровки ключа {service_name} пользователя {user_id}: {e}")
+        return None
+
+def save_gemini_user_key(user_id: int, api_key: str, service_name: str = "gemini"):
     """Шифрует и сохраняет персональный ключ пользователя для указанного сервиса."""
     if not os.path.exists(KEYS_DIR):
         os.makedirs(KEYS_DIR)
@@ -95,6 +157,15 @@ def save_user_key(user_id: int, api_key: str, service_name: str = "airforce"):
 def _get_memory_path(chat_id: int) -> str:
     return os.path.join(MEMORY_DIR, f"{chat_id}_memory.json")
 
+def save_chat_max_history(chat_id: int, max_history: int):
+    cid = str(chat_id)
+    if cid not in chat_settings_cache:
+        chat_settings_cache[cid] = {"trigger_word": "пупс"}
+    
+    chat_settings_cache[cid]["max_history"] = max_history
+    with open(CHAT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chat_settings_cache, f, ensure_ascii=False, indent=4)
+
 def load_memory(chat_id: int):
     file_path = _get_memory_path(chat_id)
     default_memory = {
@@ -119,21 +190,28 @@ def save_memory(chat_id: int, chat_memory_data: dict):
             json.dump(chat_memory_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Ошибка при сохранении памяти: {e}")
-
-def append_history(memory_data: dict, opponent_message: str = None, my_response: str = None, max_history: int = 150) -> dict:
+    
+def append_history(memory_data: dict, opponent_message: str = None, my_response: str = None, chat_id: int = None) -> dict:
     moscow_tz = pytz.timezone('Europe/Moscow')
     timestamp = datetime.now(moscow_tz).strftime("[%Y-%m-%d %H:%M:%S]")
     
-    # Добавляем сообщение пользователя
+    # 1. Приоритет: кастомный лимит из настроек чата
+    cid = str(chat_id) if chat_id else None
+    if cid and cid in chat_settings_cache and "max_history" in chat_settings_cache[cid]:
+        max_history = chat_settings_cache[cid]["max_history"]
+    # 2. Дефолтный лимит в зависимости от модели
+    elif chat_id and get_chat_model(chat_id) == "gemini":
+        max_history = 1000
+    else:
+        max_history = 150
+
     if opponent_message:
         user_content = f"{timestamp} {opponent_message}"
         memory_data["history"].append({"role": "user", "content": user_content})
     
-    # Добавляем ответ ассистента только если он есть
     if my_response:
         memory_data["history"].append({"role": "assistant", "content": my_response})
     
-    # Если сообщений стало больше лимита — отрезаем старые
     if len(memory_data["history"]) > max_history:
         memory_data["history"] = memory_data["history"][-max_history:]
             

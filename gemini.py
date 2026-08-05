@@ -157,6 +157,7 @@ async def priem_vision(chat_id: int, current_user_message: str, base64_image: st
 
 
 async def priem_video(chat_id: int, current_user_message: str, base64_video: str, mime_type: str = "video/mp4", user_key: str = None) -> str:
+    print(current_user_message)
     client = _get_gemini_client(user_key)
     memory = load_memory(chat_id)
     

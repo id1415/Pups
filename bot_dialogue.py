@@ -7,6 +7,7 @@ import asyncio
 import os
 from datetime import datetime
 from aiogram import Router, Bot, types as aiogram_types
+from variables import CHAT_TRIGGER_WORD, PROMPT
 
 dialogue_router = Router()
 logger = logging.getLogger(__name__)
@@ -83,14 +84,13 @@ async def restore_dialogues(bot: Bot):
 async def send_dialogue_message(chat_id: int, topic_id: int, bot: Bot):
     """Фоновая задача: запрашивает ответ у ИИ и отправляет его в текущий топик/чат"""
     from bot11_pups import generate_response
-    import prompt
 
     try:
         # Запрашиваем генерацию. Контекст автоматически подтягивается из chat_memories.
         response_text = await generate_response(
             chat_id=chat_id,
             thread_id=topic_id,
-            system_prompt=prompt.PUPPS5,  # У Деда в его папке здесь будет свой prompt.DED
+            system_prompt=PROMPT,  # У Деда в его папке здесь будет свой prompt.DED
             current_user_message=""
         )
 
@@ -106,7 +106,7 @@ async def send_dialogue_message(chat_id: int, topic_id: int, bot: Bot):
 def start_command_filter(message: aiogram_types.Message) -> bool:
     if not message.text:
         return False
-    from bot11_pups import CHAT_TRIGGER_WORD
+
     trigger = CHAT_TRIGGER_WORD.lower()
     text = message.text.lower().strip()
     return bool(re.match(rf'^({trigger})\s+start(?:\s+(\d+))?$', text))
@@ -114,7 +114,7 @@ def start_command_filter(message: aiogram_types.Message) -> bool:
 def stop_command_filter(message: aiogram_types.Message) -> bool:
     if not message.text:
         return False
-    from bot11_pups import CHAT_TRIGGER_WORD
+
     trigger = CHAT_TRIGGER_WORD.lower()
     text = message.text.lower().strip()
     return bool(re.match(rf'^({trigger})\s+stop$', text))
@@ -123,7 +123,7 @@ def stop_command_filter(message: aiogram_types.Message) -> bool:
 
 @dialogue_router.message(start_command_filter)
 async def start_dialogue_cmd(message: aiogram_types.Message, bot: Bot):
-    from bot11_pups import scheduler, CHAT_TRIGGER_WORD
+    from bot11_pups import scheduler
     
     chat_id = message.chat.id
     topic_id = message.message_thread_id 
@@ -183,10 +183,8 @@ async def start_dialogue_cmd(message: aiogram_types.Message, bot: Bot):
         "is_active": True
     }
     save_dialogue_config(config)
-    
-    bot_name = CHAT_TRIGGER_WORD.capitalize()
         
-    await message.reply(f"✅ Режим авто сообщений активирован! {bot_name} будет писать сюда каждые {interval_minutes} мин.")
+    await message.reply(f"✅ Режим авто сообщений активирован! {CHAT_TRIGGER_WORD.capitalize()} будет писать сюда каждые {interval_minutes} мин.")
     
     # Сразу генерируем и отправляем первую реплику
     await send_dialogue_message(chat_id, topic_id, bot)
