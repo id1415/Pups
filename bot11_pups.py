@@ -35,42 +35,6 @@ import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video
 
-# Загружаем модель (делается 1 раз при старте)
-device = torch.device('cpu')
-model, _ = torch.hub.load(
-    repo_or_dir='snakers4/silero-models',
-    model='silero_tts',
-    language='ru',
-    speaker='v4_ru'
-)
-model.to(device)
-
-async def text_to_voice_bytes_silero(text: str) -> io.BytesIO:
-    sample_rate = 48000
-    speaker = 'aidar'
-
-    # 1. Генерируем аудио-тензор
-    audio = model.apply_tts(
-        text=text,
-        speaker=speaker,
-        sample_rate=sample_rate,
-        put_accent=True,
-        put_yo=True
-    )
-    
-    # 2. Делаем массив 1D (.squeeze() убирает лишнюю размерность [1, N] -> [N])
-    y = audio.squeeze().numpy()
-
-    # 3. Применяем pitch_shift (значение от 3.0 до 6.0 дает классный детский/высокий тон)
-    n_steps = 10
-    y_child = librosa.effects.pitch_shift(y, sr=sample_rate, n_steps=n_steps)
-    
-    # 4. Сохраняем в BytesIO
-    wav_io = io.BytesIO()
-    sf.write(wav_io, y_child, sample_rate, format='OGG', subtype='OPUS')
-    wav_io.seek(0)
-    return wav_io
-
 commands = ['нейробот инфо', 'нейробот name', 'нейробот prompt', 'нейробот chat', 'нейробот vision', 'нейробот image', 'нейробот music', 'нейробот start', 'нейробот stop', 'нейробот 0',
             'кибербот инфо', 'кибербот name', 'кибербот prompt', 'кибербот chat', 'кибербот vision', 'кибербот image', 'кибербот music', 'кибербот start', 'кибербот stop', 'кибербот 0',
             'пупс инфо', 'пупс chat', 'пупс vision', 'пупс image', 'пупс music', 'пупс start', 'пупс stop', 'пупс 0',
@@ -1082,12 +1046,12 @@ async def handle_voice_message(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     is_private = message.chat.type == "private"
 
-    # 1. Скачиваем ГС
+    # 1. Скачиваем голосовое сообщение из Telegram
     voice = message.voice
     file_info = await bot.get_file(voice.file_id)
     file_bytes_io = await bot.download_file(file_info.file_path)
 
-    # 2. Конвертируем в WAV
+    # 2. Перекодируем OGG/Opus в WAV в памяти с помощью pydub
     try:
         audio = AudioSegment.from_file(file_bytes_io, format="ogg")
         wav_io = io.BytesIO()
@@ -1097,49 +1061,42 @@ async def handle_voice_message(message: aiogram_types.Message):
         print(f"Ошибка конвертации аудио: {e}")
         return
 
-    # 3. Распознаем речь
+    # 3. Распознаем речь через Google Speech Recognition (бесплатно, без API ключей)
     recognizer = sr.Recognizer()
     try:
         with sr.AudioFile(wav_io) as source:
             audio_data = recognizer.record(source)
+            # Распознаем на русском языке
             recognized_text = recognizer.recognize_google(audio_data, language="ru-RU")
             print(f"🎙️ [Голос от {user_name}]: {recognized_text}")
     except sr.UnknownValueError:
         print("Гугл не смог разобрать речь в ГС.")
         return
-    except Exception as e:
-        print(f"Ошибка распознавания: {e}")
+    except sr.RequestError as e:
+        print(f"Ошибка сервиса распознавания: {e}")
         return
 
-    # 4. Проверяем условия триггера
+    # 4. Проверяем условие (В личке — всегда, в группе — по триггеру)
     is_triggered = CHAT_TRIGGER_WORD in recognized_text.lower()
 
     if is_private or is_triggered:
-        text_to_ai = f"{user_name}: {recognized_text}"
+        text_to_ai = f"{user_name} (голосовое сообщение): {recognized_text}"
         
         try:
-            # Ставим статус "Записывает голосовое сообщение..."
-            await bot.send_chat_action(chat_id, "record_voice", message_thread_id=thread_id)
+            await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             
-            # Сохраняем входящее сообщение пользователя в контекст
             memory = load_memory(chat_id)
             formatted_user_msg = f"[Голосовое] {user_name}: {recognized_text}"
             memory = append_history(memory, opponent_message=formatted_user_msg, chat_id=chat_id)
             save_memory(chat_id, memory)
-
-            # Генерируем текстовый ответ ИИ
-            response_text = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_id=user_id)
             
-            # Озвучиваем ответ генератором речи
-            voice_bytes = await text_to_voice_bytes_silero(response_text)
-            voice_file = BufferedInputFile(voice_bytes.read(), filename="pups_answer.ogg")
-
-            # Отправляем ответное ГОЛОСОВОЕ сообщение
-            await bot.send_voice(
-                chat_id=chat_id,
-                voice=voice_file,
-                caption=f"{response_text}" if len(response_text) < 1000 else None, # Опционально: текстовая расшифровка под ГС
-                message_thread_id=thread_id,
+            response = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_id=user_id)
+            
+            # Отвечаем текстом, цитируя оригинальное ГС
+            await bot.send_message(
+                chat_id, 
+                response, 
+                message_thread_id=thread_id, 
                 reply_to_message_id=message.message_id
             )
 
@@ -1151,15 +1108,10 @@ async def handle_voice_message(message: aiogram_types.Message):
                     "text": f"[Голосовое] {recognized_text}",
                     "time": time.strftime("%H:%M")
                 })
-                log_data.append({
-                    "user": CHAT_TRIGGER_WORD.capitalize(),
-                    "text": f"[Голосовое] {response_text}",
-                    "time": time.strftime("%H:%M")
-                })
                 save_chat_log(chat_id, log_data)
 
         except Exception as e:
-            print(f"Ошибка при формировании голосового ответа: {e}")
+            print(f"Ошибка ответа на голосовое: {e}")
             await send_log_to_telegram(f"{e}", "Voice Handler", chat_id, thread_id, user_name)
             
 # Хендлер для записи всех сообщений в контекст

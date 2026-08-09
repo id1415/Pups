@@ -19,6 +19,8 @@ IMAGE_SETTINGS_FILE = "image_settings.json"
 image_settings_cache = {}
 MUSIC_SETTINGS_FILE = "music_settings.json"
 music_settings_cache = {}
+MAX_HISTORY_GEMINI = 500
+MAX_HISTORY_AIRFORCE = 150
 
 def _get_fernet():
     """Инициализирует объект шифрования, если ключ задан."""
@@ -201,9 +203,9 @@ def append_history(memory_data: dict, opponent_message: str = None, my_response:
         max_history = chat_settings_cache[cid]["max_history"]
     # 2. Дефолтный лимит в зависимости от модели
     elif chat_id and get_chat_model(chat_id) == "gemini":
-        max_history = 1000
+        max_history = MAX_HISTORY_GEMINI
     else:
-        max_history = 150
+        max_history = MAX_HISTORY_AIRFORCE
 
     if opponent_message:
         user_content = f"{timestamp} {opponent_message}"
