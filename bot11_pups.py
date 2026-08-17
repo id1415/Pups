@@ -15,7 +15,7 @@ from aiogram import BaseMiddleware
 from aiogram.filters import CommandStart, Filter
 from aiogram import Dispatcher, Router, types as aiogram_types, F
 from aiogram.types import Message
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from google.genai import types
 from utils import (load_memory, save_memory, append_history, clear_memory,
                    load_airforce_user_key, save_airforce_user_key, load_gemini_user_key, save_gemini_user_key,
@@ -786,7 +786,15 @@ async def handle_set_image_model(message: aiogram_types.Message):
     save_image_model(message.chat.id, chosen_model)
     await message.reply(f"✅ Успешно! Теперь в этом чате запросы с картинками отправляются в: {chosen_model}")
 
-@main_router.message((F.video | F.video_note), lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()) or (m.text and f'{CHAT_TRIGGER_WORD}' in m.text.lower()))
+#@main_router.message(F.video, lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()) or (m.text and f'{CHAT_TRIGGER_WORD}' in m.text.lower()))
+@main_router.message(
+    (F.video | F.video_note), 
+    lambda m: (
+        m.chat.type == ChatType.PRIVATE or 
+        (m.caption and f'{CHAT_TRIGGER_WORD}'.lower() in m.caption.lower()) or 
+        (m.text and f'{CHAT_TRIGGER_WORD}'.lower() in m.text.lower())
+    )
+)
 async def handle_video_vision(message: aiogram_types.Message):
     chat_id = message.chat.id
     thread_id = message.message_thread_id if message.is_topic_message else None
@@ -852,7 +860,10 @@ async def handle_video_vision(message: aiogram_types.Message):
         print(f"❌ Ошибка в handle_video_vision: {error_details}")
         await send_log_to_telegram(error_details, "Video Handler", chat_id, thread_id, user_name)
 
-@main_router.message(F.photo, lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()))
+#@main_router.message(F.photo, lambda m: (m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower()))
+@main_router.message(F.photo, lambda m: (
+    m.chat.type == ChatType.PRIVATE or (m.caption and f'{CHAT_TRIGGER_WORD}'.lower() in m.caption.lower())
+))
 async def handle_photo_vision(message: aiogram_types.Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
