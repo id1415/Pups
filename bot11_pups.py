@@ -6,9 +6,6 @@ import base64
 import re
 import prompt
 import time
-import torch
-import librosa
-import soundfile as sf
 import speech_recognition as sr
 from pydub import AudioSegment
 import io
@@ -17,7 +14,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import BaseMiddleware
 from aiogram.filters import CommandStart, Filter
 from aiogram import Dispatcher, Router, types as aiogram_types, F
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message
 from aiogram.enums import ParseMode
 from google.genai import types
 from utils import (load_memory, save_memory, append_history, clear_memory,
@@ -25,7 +22,7 @@ from utils import (load_memory, save_memory, append_history, clear_memory,
                    get_chat_model, get_image_model, get_vision_model, get_music_model, 
                    save_chat_model, save_image_model, save_vision_model, save_music_model, 
                    load_chat_settings, load_image_settings, load_vision_settings, load_music_settings,
-                   get_chat_log, save_chat_log, clear_chat_log,  # для функции пересказа
+                   get_chat_log, save_chat_log, clear_chat_log, # для функции пересказа
                    save_chat_max_history)
 from summary import is_summary_enabled, set_summary_state, process_pupps_summary, daily_summary_executor
 from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_COMMAND, PROMPT, MAX_RETRIES, RETRY_DELAY,
@@ -35,14 +32,11 @@ import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video
 
-commands = ['нейробот инфо', 'нейробот name', 'нейробот prompt', 'нейробот chat', 'нейробот vision', 'нейробот image', 'нейробот music', 'нейробот start', 'нейробот stop', 'нейробот 0',
-            'кибербот инфо', 'кибербот name', 'кибербот prompt', 'кибербот chat', 'кибербот vision', 'кибербот image', 'кибербот music', 'кибербот start', 'кибербот stop', 'кибербот 0',
+commands = ['нейро инфо', 'нейро name', 'нейро prompt', 'нейро chat', 'нейро vision', 'нейро image', 'нейро music', 'нейро start', 'нейро stop', 'нейро 0',
+            'кибер инфо', 'кибер name', 'кибер prompt', 'кибер chat', 'кибер vision', 'кибер image', 'кибер music', 'кибер start', 'кибер stop', 'кибер 0',
             'пупс инфо', 'пупс chat', 'пупс vision', 'пупс image', 'пупс music', 'пупс start', 'пупс stop', 'пупс 0',
             'няша инфо', 'няша chat', 'няша vision', 'няша image', 'няша music', 'няша start', 'няша stop', 'няша 0',
-            'дед инфо', 'дед chat', 'дед vision', 'дед image', 'дед music', 'дед start', 'дед stop', 'дед 0',
-            'джейсон инфо', 'джейсон chat', 'джейсон vision', 'джейсон image', 'джейсон music', 'джейсон start', 'джейсон stop', 'джейсон 0',
-            'нуар инфо', 'нуар chat',  'нуар vision', 'нуар image', 'нуар music', 'нуар start', 'нуар stop', 'нуар 0',
-            'пупс context']
+            'пупс context', 'няша context', 'нейро context', 'кибер context']
 
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 dp = Dispatcher()
@@ -273,6 +267,7 @@ async def generate_vision_response(chat_id: int,
     if vision_model == "gemini":
         user_key = load_gemini_user_key(user_id)
         active_key = user_key if user_key else API_KEY_GEMINI
+        print(current_user_message)
         return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=active_key)
     else:
         user_key = load_airforce_user_key(user_id)
@@ -683,13 +678,22 @@ async def handle_set_music_model(message: aiogram_types.Message):
     
     if len(parts) < 3:
         current_model = get_music_model(message.chat.id)
-        await message.reply(
+        full_text = (
             f"🤖 Текущая модель для музыки в этом чате: {current_model}\n\n"
             f"Доступные варианты для смены (нажмите на имя, чтобы скопировать):\n"
             f"{models_text}\n\n"  # Выводим уже готовый текст из get_models_info.py
-            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} music название_модели`",
-            parse_mode="Markdown",  # Важно для работы кликабельности!
+            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} music название_модели`"
         )
+        
+        chunks = split_by_lines(full_text, max_length=4000)
+        
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
+                continue
+            if i == 0:
+                await message.reply(chunk, parse_mode="Markdown")
+            else:
+                await message.answer(chunk, parse_mode="Markdown")
         return
         
     chosen_model = parts[2].strip().lower()
@@ -713,13 +717,24 @@ async def handle_set_vision_model(message: aiogram_types.Message):
     
     if len(parts) < 3:
         current_model = get_vision_model(message.chat.id)
-        await message.reply(
+        full_text = (
             f"🤖 Текущая модель vision в этом чате: {current_model}\n\n"
             f"Доступные варианты для смены (нажмите на имя, чтобы скопировать):\n"
             f"{models_text}\n\n"  # Выводим уже готовый текст из get_models_info.py
-            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} vision название_модели`",
-            parse_mode="Markdown",  # Важно для работы кликабельности!
+            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} vision название_модели`"
         )
+        
+        chunks = split_by_lines(full_text, max_length=4000)
+        
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
+                continue
+            if i == 0:
+                await message.reply(chunk, parse_mode="Markdown")
+            else:
+                await message.answer(chunk, parse_mode="Markdown")
+        return
+        
         return
         
     chosen_model = parts[2].strip().lower()
@@ -743,13 +758,24 @@ async def handle_set_image_model(message: aiogram_types.Message):
     
     if len(parts) < 3:
         current_model = get_image_model(message.chat.id)
-        await message.reply(
+        full_text = (
             f"🤖 Текущая модель для генерации картинок в этом чате: {current_model}\n\n"
             f"Доступные варианты для смены (нажмите на имя, чтобы скопировать):\n"
             f"{models_text}\n\n"  # Выводим уже готовый текст из get_models_info.py
-            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} image название_модели`",
-            parse_mode="Markdown",  # Важно для работы кликабельности!
+            f"Чтобы изменить, напиши:\n`{CHAT_TRIGGER_WORD} image название_модели`"
         )
+        
+        chunks = split_by_lines(full_text, max_length=4000)
+        
+        for i, chunk in enumerate(chunks):
+            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
+                continue
+            if i == 0:
+                await message.reply(chunk, parse_mode="Markdown")
+            else:
+                await message.answer(chunk, parse_mode="Markdown")
+        return
+        
         return
         
     chosen_model = parts[2].strip().lower()
@@ -852,7 +878,7 @@ async def handle_photo_vision(message: aiogram_types.Message):
             thread_id, 
             PROMPT, 
             text, 
-            encoded_image, 
+            encoded_image,
             user_id=user_id
         )
         
@@ -886,8 +912,8 @@ async def handle_info(message: aiogram_types.Message):
 async def handle_toggle_summary_on(message: aiogram_types.Message):
     chat_id = message.chat.id   
     thread_id = message.message_thread_id if message.is_topic_message else None
-    
     is_admin = False
+    
     try:
         member = await bot.get_chat_member(chat_id, message.from_user.id)
         is_admin = member.status in ["creator", "administrator"]
@@ -1167,7 +1193,7 @@ async def cmd_start(message: aiogram_types.Message):
     await message.answer(pupps_info.pupps_info, parse_mode=ParseMode.MARKDOWN_V2)
     
 @main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey airforce'))
-async def handle_set_key(message: aiogram_types.Message):
+async def handle_set_airforce_key(message: aiogram_types.Message):
     user_id = message.from_user.id
     parts = message.text.split(maxsplit=2)
     
@@ -1192,7 +1218,7 @@ async def handle_set_key(message: aiogram_types.Message):
         await message.reply("❌ Произошла ошибка при сохранении ключа.")
         
 @main_router.message(F.chat.type == "private", lambda m: m.text and m.text.startswith('/setkey gemini'))
-async def handle_set_key(message: aiogram_types.Message):
+async def handle_set_gemini_key(message: aiogram_types.Message):
     user_id = message.from_user.id
     parts = message.text.split(maxsplit=2)
     

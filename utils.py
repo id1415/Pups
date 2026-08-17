@@ -4,7 +4,7 @@ from datetime import datetime
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 import pytz
-from variables import MASTER_KEY
+from variables import MASTER_KEY, CHAT_TRIGGER_WORD
 
 load_dotenv()
 
@@ -162,7 +162,7 @@ def _get_memory_path(chat_id: int) -> str:
 def save_chat_max_history(chat_id: int, max_history: int):
     cid = str(chat_id)
     if cid not in chat_settings_cache:
-        chat_settings_cache[cid] = {"trigger_word": "пупс"}
+        chat_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
     
     chat_settings_cache[cid]["max_history"] = max_history
     with open(CHAT_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -258,7 +258,7 @@ def get_music_model(chat_id: int) -> str:
 def save_chat_model(chat_id: int, model_name: str):
     cid = str(chat_id)
     if cid not in chat_settings_cache:
-        chat_settings_cache[cid] = {"trigger_word": "пупс"}
+        chat_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
     
     chat_settings_cache[cid]["model_name"] = model_name.strip()
     with open(CHAT_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -267,7 +267,7 @@ def save_chat_model(chat_id: int, model_name: str):
 def save_image_model(chat_id: int, model_name: str):
     cid = str(chat_id)
     if cid not in image_settings_cache:
-        image_settings_cache[cid] = {"trigger_word": "пупс"}
+        image_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
     
     image_settings_cache[cid]["model_name"] = model_name.strip()
     with open(IMAGE_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -276,7 +276,7 @@ def save_image_model(chat_id: int, model_name: str):
 def save_vision_model(chat_id: int, model_name: str):
     cid = str(chat_id)
     if cid not in vision_settings_cache:
-        vision_settings_cache[cid] = {"trigger_word": "пупс"}
+        vision_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
     
     vision_settings_cache[cid]["model_name"] = model_name.strip()
     with open(VISION_SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -285,7 +285,7 @@ def save_vision_model(chat_id: int, model_name: str):
 def save_music_model(chat_id: int, model_name: str):
     cid = str(chat_id)
     if cid not in music_settings_cache:
-        music_settings_cache[cid] = {"trigger_word": "пупс"}
+        music_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
     
     music_settings_cache[cid]["model_name"] = model_name.strip()
     with open(MUSIC_SETTINGS_FILE, "w", encoding="utf-8") as f:

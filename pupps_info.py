@@ -19,7 +19,7 @@ Lyrics: В траве сидел кузнечик...
 
 ⚙️ *Настройки моделей:*
 • `{CHAT_TRIGGER_WORD} инфо` — показать эту справку\\.
-• `{CHAT_TRIGGER_WORD} gemini` — переключает нейронку на gemini (установлена по умолчанию)\\.
+• `{CHAT_TRIGGER_WORD} gemini` — переключает модель на gemini \\(установлена по умолчанию\\)\\.
 • `{CHAT_TRIGGER_WORD} chat` — список моделей для общения\\.
 • `{CHAT_TRIGGER_WORD} vision` — список моделей для зрения\\.
 • `{CHAT_TRIGGER_WORD} image` — список моделей для генерации картинок\\.
@@ -61,15 +61,5 @@ Lyrics: В траве сидел кузнечик...
 *Gemini:*
 500 запросов в день, 15 в минуту\\.
 Ограничение контекста — 1 000 000 токенов\\.
-
-🤖 Другие мои боты:
-Няша — @nyasha\\_russia\\_bot
-Дед — @ded\\_ussr\\_bot
-Нуар — @neuro\\_noir\\_bot
-Джейсон — @neuro\\_jason\\_bot
-Нейро — @neuro\\_tun\\_bot
-Кибер — @cyber\\_tun\\_bot
-Чигур — @neuro\\_druzh\\_bot
-Зоя — @neuro\\_zoya\\_bot
 
 📢 Новости проекта: @neuro\\_pupps'''
