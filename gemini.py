@@ -28,7 +28,7 @@ async def priem_summary(prompt_text: str, user_key: str = None) -> str:
     for attempt in range(5):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-3.1-flash-lite-preview",
+                model="gemini-3.5-flash-lite",
                 contents=prompt_text,
                 config=config
             )
