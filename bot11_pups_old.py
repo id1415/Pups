@@ -6,7 +6,6 @@ import base64
 import re
 import prompt
 import time
-import random
 import speech_recognition as sr
 from pydub import AudioSegment
 import io
@@ -28,8 +27,7 @@ from utils import (load_memory, save_memory, append_history, clear_memory,
 from summary import is_summary_enabled, set_summary_state, process_pupps_summary, daily_summary_executor
 from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_COMMAND, PROMPT, MAX_RETRIES, RETRY_DELAY,
                        AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI,
-                       client,
-                       COMFY_URL, IMAGE_PROMPT)
+                       client)
 import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video, process_voice_turn
@@ -38,8 +36,7 @@ commands = ['нейро инфо', 'нейро name', 'нейро prompt', 'не
             'кибер инфо', 'кибер name', 'кибер prompt', 'кибер chat', 'кибер vision', 'кибер image', 'кибер music', 'кибер start', 'кибер stop', 'кибер 0',
             'пупс инфо', 'пупс chat', 'пупс vision', 'пупс image', 'пупс music', 'пупс start', 'пупс stop', 'пупс 0',
             'няша инфо', 'няша chat', 'няша vision', 'няша image', 'няша music', 'няша start', 'няша stop', 'няша 0',
-            'пупс context', 'няша context', 'нейро context', 'кибер context',
-            'пупс image local', 'пупс image airforce', 'няша image local', 'няша image airforce']
+            'пупс context', 'няша context', 'нейро context', 'кибер context']
 
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 dp = Dispatcher()
@@ -270,6 +267,7 @@ async def generate_vision_response(chat_id: int,
     if vision_model == "gemini":
         user_key = load_gemini_user_key(user_id)
         active_key = user_key if user_key else API_KEY_GEMINI
+        print(current_user_message)
         return await gemini_priem_vision(chat_id, current_user_message, base64_image, user_key=active_key)
     else:
         user_key = load_airforce_user_key(user_id)
@@ -382,39 +380,6 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
                 time.sleep(RETRY_DELAY)
                 continue
             raise RuntimeError(f"Ошибка после {MAX_RETRIES} попыток: {e}")
-            
-async def generate_image_prompt(chat_id: int,
-                                thread_id: int,
-                                current_user_message: str,
-                                user_id: int = None) -> str:
-    """
-    Создаёт промт для картинки текущей чат-моделью.
-    Модели передаётся контекст: история переписки + сам запрос.
-    """
-    chat_model = get_chat_model(chat_id)
-
-    # ВАЖНО: и gemini_priem, и _sync_airforce_request строят запрос к модели
-    # ТОЛЬКО из памяти (передаваемый текст сообщения они не используют).
-    # Поэтому сначала записываем запрос в историю — так модель видит его
-    # вместе с контекстом переписки. Ответ (промт) обе функции сохранят сами.
-    #memory = load_memory(chat_id)
-    #memory = append_history(memory, opponent_message=current_user_message, chat_id=chat_id)
-    #save_memory(chat_id, memory)
-
-    if chat_model == "gemini":
-        user_key = load_gemini_user_key(user_id)
-        active_key = user_key if user_key else API_KEY_GEMINI
-        return await gemini_priem(chat_id, current_user_message, user_key=active_key,
-                                  system_prompt=IMAGE_PROMPT)  # <-- отдельный промт для картинок
-    else:
-        user_key = load_airforce_user_key(user_id)
-        active_key = user_key if user_key else AIRFORCE_API_KEY
-        return await asyncio.to_thread(_sync_airforce_request,
-                                       chat_id,
-                                       thread_id,
-                                       IMAGE_PROMPT,  # <-- системная инструкция для промта вместо PROMPT
-                                       current_user_message,
-                                       active_key)
 
 def generate_media_sync(user_id, prompt_text, chat_id, thread_id, image_url=[], is_music=False, aspect_ratio="1:1"):
     url = "https://api.airforce/v1/images/generations"
@@ -528,129 +493,6 @@ def generate_media_sync(user_id, prompt_text, chat_id, thread_id, image_url=[], 
             continue
     
     raise RuntimeError("Не удалось сгенерировать медиа после всех попыток.")
-    
-# ================== ЛОКАЛЬНАЯ ГЕНЕРАЦИЯ ЧЕРЕЗ ComfyUI ==================
-
-def _load_comfy_workflow(filename: str):
-    """Безопасно грузит шаблон workflow, чтобы бот не падал, если файла нет."""
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"⚠️ ComfyUI: файл {filename} не найден! Локальная генерация недоступна.")
-        return None
-
-workflow_t2i = _load_comfy_workflow('workflow_t2i.json')      # текст -> картинка
-workflow_edit = _load_comfy_workflow('flux_image_edit.json')  # редактирование
-
-def is_comfyui_online(timeout: int = 5) -> bool:
-    """Пингует ComfyUI через /system_stats. True — сервер доступен."""
-    try:
-        response = requests.get(f"{COMFY_URL}/system_stats", timeout=timeout)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
-        return False
-
-def poll_comfyui(prompt_id: str, timeout: int = 900) -> str:
-    """Опрашивает ComfyUI до завершения генерации. Возвращает ссылку на результат."""
-    start_time = time.time()
-    while True:
-        if time.time() - start_time > timeout:
-            raise RuntimeError(f"ComfyUI: превышено время ожидания генерации ({timeout} сек).")
-        try:
-            history = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30).json()
-        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            print(f"ComfyUI: ошибка опроса статуса: {e}")
-            time.sleep(2)
-            continue
-
-        if prompt_id in history:
-            entry = history[prompt_id]
-            status = entry.get('status', {})
-            if status.get('status_str') == 'error':
-                raise RuntimeError(f"ComfyUI: ошибка выполнения workflow: {status}")
-
-            for node_id, node_output in entry.get('outputs', {}).items():
-                if 'images' in node_output:
-                    filename = node_output['images'][0]['filename']
-                    subfolder = node_output['images'][0]['subfolder']
-                    return f"{COMFY_URL}/view?filename={filename}&subfolder={subfolder}&type=output"
-        time.sleep(2)
-
-def _download_comfy_result(img_url: str) -> bytes:
-    """Скачивает готовую картинку (Телега не может открыть локальную ссылку 192.168.x.x)."""
-    img_response = requests.get(img_url, timeout=120)
-    if img_response.status_code != 200:
-        raise RuntimeError(f"ComfyUI: не удалось скачать результат (HTTP {img_response.status_code}).")
-    return img_response.content
-
-def generate_image_comfy(prompt_text: str):
-    """Текст -> картинка через локальный ComfyUI. Возвращает (байты картинки, seed)."""
-    if workflow_t2i is None:
-        raise RuntimeError("ComfyUI: workflow_t2i.json не загружен.")
-
-    sampler_node_id = "57:3"
-    prompt_node_id = "57:27"
-
-    workflow = json.loads(json.dumps(workflow_t2i))  # глубокая копия шаблона
-    workflow[prompt_node_id]["inputs"]["text"] = prompt_text
-
-    random_seed = random.randint(0, 2**53 - 1)
-    workflow[sampler_node_id]["inputs"]["seed"] = random_seed
-    workflow[sampler_node_id]["inputs"]["control_after_generate"] = "randomize"
-
-    payload = {"prompt": workflow}
-    response = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
-    if response.status_code != 200:
-        raise RuntimeError(f"ComfyUI: ошибка запроса (HTTP {response.status_code}): {response.text}")
-
-    prompt_id = response.json()['prompt_id']
-    img_url = poll_comfyui(prompt_id)
-    return _download_comfy_result(img_url), random_seed
-
-def upload_image_to_comfy(image_bytes: bytes):
-    """Загружает картинку в ComfyUI. Возвращает её имя во внутреннем хранилище."""
-    files = {'image': ('temp_image.jpg', image_bytes, 'image/jpeg')}
-    try:
-        response = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=60)
-    except requests.exceptions.RequestException as e:
-        print(f"ComfyUI: ошибка загрузки картинки: {e}")
-        return None
-    if response.status_code == 200:
-        data = response.json()
-        if data.get('subfolder'):
-            return f"{data['subfolder']}/{data['name']}"
-        return data['name']
-    return None
-
-def edit_image_comfy(prompt_text: str, image_bytes: bytes):
-    """Редактирование картинки (i2i) через локальный ComfyUI. Возвращает (байты, seed)."""
-    if workflow_edit is None:
-        raise RuntimeError("ComfyUI: flux_image_edit.json не загружен.")
-
-    image_filename = upload_image_to_comfy(image_bytes)
-    if not image_filename:
-        raise RuntimeError("ComfyUI: не удалось загрузить картинку в нейросеть.")
-
-    prompt_node_id = "75:74"
-    seed_node_id = "75:73"
-    load_image_node_id = "76"
-
-    workflow = json.loads(json.dumps(workflow_edit))
-    workflow[prompt_node_id]["inputs"]["text"] = prompt_text
-    workflow[load_image_node_id]["inputs"]["image"] = image_filename
-
-    random_seed = random.randint(0, 2**53 - 1)
-    workflow[seed_node_id]["inputs"]["noise_seed"] = random_seed
-
-    payload = {"prompt": workflow}
-    response = requests.post(f"{COMFY_URL}/prompt", json=payload, timeout=60)
-    if response.status_code != 200:
-        raise RuntimeError(f"ComfyUI: ошибка запроса Edit (HTTP {response.status_code}): {response.text}")
-
-    prompt_id = response.json()['prompt_id']
-    img_url = poll_comfyui(prompt_id)
-    return _download_comfy_result(img_url), random_seed
 
 @main_router.message(F.photo, lambda m: m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
 async def handle_photo_edit_request(message: aiogram_types.Message):
@@ -662,56 +504,43 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
     cleaned_caption, aspect_ratio = extract_aspect_ratio(raw_caption)
     prompt_text = f'{user_name}: {cleaned_caption}'
     status_msg = None
-
-    current_image_model = get_image_model(chat_id)
-
+    
     try:
         status_msg = await message.answer(f"⌛ Жди, {CHAT_TRIGGER_WORD.capitalize()} переделает твою картинку (может занять до 10 мин)...")
 
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
+        
         file_bytes_io = await bot.download_file(file.file_path)
-        file_bytes = file_bytes_io.read()
+        file_bytes = file_bytes_io.read() # Получаем чистые байты
+        imgbb_url = await asyncio.to_thread(upload_to_imgbb, file_bytes, None, chat_id, thread_id)
+        
+        if not imgbb_url:
+            raise Exception("Не удалось загрузить изображение на хостинг")
+            
+        encoded_image = base64.b64encode(file_bytes).decode('utf-8')
 
-        if current_image_model == "local":
-            # Проверяем, жив ли ComfyUI, прежде чем гонять генерацию
-            comfy_online = await asyncio.to_thread(is_comfyui_online)
-            if not comfy_online:
-                await message.reply("🖥❌ Локальный генератор временно отключён.\n\n")
-                return  # finally сам удалит статус-сообщение
-                
-            # ===== ЛОКАЛЬНОЕ РЕДАКТИРОВАНИЕ (ComfyUI, как в run.py) =====
-            user_edit_prompt = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
-            # Хочешь, чтобы промт для правки тоже писала нейронка с контекстом?
-            # Замени строку выше на: user_edit_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
-
-            photo_bytes, used_seed = await asyncio.to_thread(edit_image_comfy, user_edit_prompt, file_bytes)
-
+        detailed_prompt = await generate_vision_response(chat_id, thread_id, PROMPT, prompt_text, encoded_image)
+        
+        await asyncio.sleep(65)
+        
+        path = await asyncio.to_thread(generate_media_sync, 
+                                       user_id,
+                                       detailed_prompt, 
+                                       chat_id, 
+                                       thread_id, 
+                                       image_url=[imgbb_url], 
+                                       aspect_ratio=aspect_ratio)
+        
+        if path:
+            print('Отправка в тг...')
+            path = upload_to_imgbb(None, path, chat_id, thread_id)
             await bot.send_photo(
-                chat_id=chat_id,
-                photo=BufferedInputFile(photo_bytes, filename="comfy_edit.png"),
+                chat_id=chat_id, 
+                photo=path, 
                 message_thread_id=thread_id
             )
-            await message.answer(f"📝 Промт:\n\n{user_edit_prompt}\n\n🌱 Seed: {used_seed}")
-        else:
-            # ===== ОНЛАЙН-РЕДАКТИРОВАНИЕ (AirForce) =====
-            imgbb_url = await asyncio.to_thread(upload_to_imgbb, file_bytes, None, chat_id, thread_id)
-
-            if not imgbb_url:
-                raise Exception("Не удалось загрузить изображение на хостинг")
-
-            encoded_image = base64.b64encode(file_bytes).decode('utf-8')
-            detailed_prompt = await generate_vision_response(chat_id, thread_id, PROMPT, prompt_text, encoded_image)
-
-            await asyncio.sleep(65)
-
-            path = await asyncio.to_thread(generate_media_sync, user_id, detailed_prompt, chat_id, thread_id,
-                                           image_url=[imgbb_url], aspect_ratio=aspect_ratio)
-            if path:
-                print('Отправка в тг...')
-                path = upload_to_imgbb(None, path, chat_id, thread_id)
-                await bot.send_photo(chat_id=chat_id, photo=path, message_thread_id=thread_id)
-                await message.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
+            await message.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
         print('Готово!')
 
     except Exception as e:
@@ -727,54 +556,31 @@ async def handle_image_generation(message: aiogram_types.Message):
     user_id = message.from_user.id
     raw_text = message.text.lower()
     cleaned_text, aspect_ratio = extract_aspect_ratio(raw_text)
-    request_text = cleaned_text.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
-    prompt_text = f'{user_name}: {request_text}'
+    prompt_text = f'{user_name}: {cleaned_text}'
     chat_id = message.chat.id
     thread_id = message.message_thread_id if message.is_topic_message else None
     status_msg = None
-
+    
     current_image_model = get_image_model(chat_id)
-
-    if not request_text:
-        await message.reply(f"⚠️ {CHAT_TRIGGER_WORD.capitalize()} не понял, что рисовать. Напиши запрос после команды.")
-        return
-
+    
     try:
         status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
+        detailed_prompt = await generate_response(chat_id, thread_id, PROMPT, prompt_text, user_id=user_id)
+        await asyncio.sleep(65)
 
-        # Промт пишет текущая чат-модель, с учётом контекста переписки
-        #detailed_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
-
-        if current_image_model == "local":
-            # Проверяем, жив ли ComfyUI, прежде чем гонять генерацию
-            comfy_online = await asyncio.to_thread(is_comfyui_online)
-            if not comfy_online:
-                await message.reply("🖥❌ Локальный генератор временно отключён.\n\n")
-                return  # finally сам удалит статус-сообщение
-            
-            # ===== ЛОКАЛЬНАЯ ГЕНЕРАЦИЯ (ComfyUI) =====
-            print('Генерация...')
-            detailed_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
-            photo_bytes, used_seed = await asyncio.to_thread(generate_image_comfy, detailed_prompt)
-
+        print('Генерация...')
+        
+        path = await asyncio.to_thread(generate_media_sync, user_id, detailed_prompt, chat_id, thread_id, aspect_ratio=aspect_ratio)
+                
+        if path:
+            print('Отправка в тг...')
+            path = upload_to_imgbb(None, path, chat_id, thread_id)
             await bot.send_photo(
-                chat_id=chat_id,
-                photo=BufferedInputFile(photo_bytes, filename="comfy_image.png"),
+                chat_id=chat_id, 
+                photo=path, 
                 message_thread_id=thread_id
             )
-            await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n🌱 Seed: {used_seed}")
-        else:
-            # ===== ОНЛАЙН-ГЕНЕРАЦИЯ (AirForce) =====
-            await asyncio.sleep(65)
-            print('Генерация...')
-
-            path = await asyncio.to_thread(generate_media_sync, user_id, detailed_prompt, chat_id, thread_id, aspect_ratio=aspect_ratio)
-
-            if path:
-                print('Отправка в тг...')
-                path = upload_to_imgbb(None, path, chat_id, thread_id)
-                await bot.send_photo(chat_id=chat_id, photo=path, message_thread_id=thread_id)
-                await message.answer(f"📝 Промт:\n\n{detailed_prompt}")
+            await message.answer(f"📝 Промт:\n\n{detailed_prompt}")
 
         print('Готово!')
 
@@ -938,22 +744,6 @@ async def handle_set_vision_model(message: aiogram_types.Message):
         
     save_vision_model(message.chat.id, chosen_model)
     await message.reply(f"✅ Успешно! Теперь в этом чате запросы с картинками отправляются в: {chosen_model}")
-    
-@main_router.message(F.text.lower().contains(f"{CHAT_TRIGGER_WORD} image local"))
-async def handle_set_image_local(message: aiogram_types.Message):
-    save_image_model(message.chat.id, "local")
-    await message.reply(
-        f"🖥 Локалка включена! Теперь картинки в этом чате генерятся через ComfyUI админа\n\n"
-        f"Генерация: `{CHAT_TRIGGER_WORD} {IMAGE_TRIGGER_COMMAND} ...`\n"
-        f"Редактирование: скинь фото с подписью `{CHAT_TRIGGER_WORD} {IMAGE_TRIGGER_COMMAND} ...`\n\n"
-        f"Вернуться на онлайн: `{CHAT_TRIGGER_WORD} image airforce`",
-        parse_mode="Markdown"
-    )
-
-@main_router.message(F.text.lower().contains(f"{CHAT_TRIGGER_WORD} image airforce"))
-async def handle_set_image_airforce(message: aiogram_types.Message):
-    save_image_model(message.chat.id, "flux-2-klein-9b")
-    await message.reply(f"🌐 Вернул онлайн-генерацию через AirForce (flux-2-klein-9b).\n\nСписок моделей: `{CHAT_TRIGGER_WORD} image`", parse_mode="Markdown")
     
 @main_router.message(F.text.lower().contains(f"{CHAT_TRIGGER_WORD} image"))
 async def handle_set_image_model(message: aiogram_types.Message):
