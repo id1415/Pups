@@ -240,8 +240,8 @@ def get_chat_model(chat_id: int) -> str:
 def get_image_model(chat_id: int) -> str:
     cid = str(chat_id)
     if cid in image_settings_cache:
-        return image_settings_cache[cid].get("model_name", "flux-2-pro")
-    return "flux-2-klein-9b"  # Модель по умолчанию, если чата нет в базе
+        return image_settings_cache[cid].get("model_name", "local")
+    return "local"  # Модель по умолчанию, если чата нет в базе
     
 def get_vision_model(chat_id: int) -> str:
     cid = str(chat_id)

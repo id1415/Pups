@@ -241,7 +241,7 @@ async def priem(chat_id: int, current_user_message: str, user_key: str = None, s
     raise RuntimeError("Не удалось получить ответ от Gemini.")
 
 
-async def priem_vision(chat_id: int, current_user_message: str, base64_image: str, user_key: str = None) -> str:
+async def priem_vision(chat_id: int, current_user_message: str, base64_image: str, user_key: str = None, system_prompt: str = PROMPT) -> str:
     client = _get_gemini_client(user_key)
     memory = load_memory(chat_id)
     
@@ -278,7 +278,7 @@ async def priem_vision(chat_id: int, current_user_message: str, base64_image: st
 
     config = types.GenerateContentConfig(
         temperature=0.9,
-        system_instruction=PROMPT
+        system_instruction=system_prompt
     )
 
     for attempt in range(5):

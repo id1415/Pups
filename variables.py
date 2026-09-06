@@ -25,6 +25,8 @@ WORKER_URL = os.getenv("WORKER_URL")
 WORKER_API_KEY = os.getenv("WORKER_API_KEY")
 COMFY_URL = os.getenv('COMFY_URL', 'http://192.168.0.4:8188')  # порт 8188 по умолчанию, как в run.py
 IMAGE_PROMPT = prompt.PUPS_IMAGE
+VIDEO_TRIGGER_COMMAND = "анимируй"
+VIDEO_PROMPT = prompt.PUPS_VIDEO
 
 session = AiohttpSession(timeout=300)
 bot = Bot(
