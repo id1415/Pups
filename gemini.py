@@ -261,20 +261,18 @@ async def priem_vision(chat_id: int, current_user_message: str, base64_image: st
                 )
             )
     
-    image_bytes = base64.b64decode(base64_image)
+    #image_bytes = base64.b64decode(base64_image)
+    images = base64_image if isinstance(base64_image, list) else [base64_image]
     
     if contents and contents[-1].role == "user":
         contents.pop()
     
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                types.Part.from_text(text=current_user_message)
-            ]
-        )
-    )
+    parts = []
+    for img in images:
+        parts.append(types.Part.from_bytes(data=base64.b64decode(img), mime_type="image/jpeg"))
+    parts.append(types.Part.from_text(text=current_user_message))
+
+    contents.append(types.Content(role="user", parts=parts))
 
     config = types.GenerateContentConfig(
         temperature=0.9,

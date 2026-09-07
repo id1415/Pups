@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 import json
 import os
 import requests
@@ -30,7 +31,7 @@ from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_C
                        AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI,
                        client,
                        COMFY_URL, IMAGE_PROMPT,
-                       VIDEO_TRIGGER_COMMAND, VIDEO_PROMPT)
+                       VIDEO_TRIGGER_COMMAND, VIDEO_PROMPT, MULTI_EDIT_PROMPT)
 import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video, process_voice_turn
@@ -367,6 +368,7 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
         if item.get("role") in ["user", "assistant"]:
             messages_to_send.append({"role": item["role"], "content": item["content"]})
     
+    '''
     current_content = [
         {"type": "text", "text": current_user_message},
         {
@@ -374,6 +376,16 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
             "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
         }
     ]
+    '''
+    
+    images = base64_image if isinstance(base64_image, list) else [base64_image]
+    current_content = [{"type": "text", "text": current_user_message}]
+    for img in images:
+        current_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{img}"}
+        })
+    
     messages_to_send.append({"role": "user", "content": current_content})
     
     payload = {
@@ -528,6 +540,20 @@ async def generate_video_i2v_prompt(chat_id: int,
     return await generate_vision_response(chat_id, thread_id, _compose_video_system_prompt(duration),
                                            current_user_message, encoded_image,
                                            user_id=user_id)
+                                           
+async def generate_multi_edit_prompt(chat_id, thread_id, current_user_message, images_b64: list, user_id=None):
+    """Промт для совмещения двух картинок: vision-модель видит обе + контекст чата."""
+    memory = load_memory(chat_id)
+    request_core = current_user_message.split(":", 1)[-1].strip()
+    recent_users = [m for m in memory.get("history", [])[-6:] if m.get("role") == "user"]
+    already_saved = bool(request_core) and any(request_core in m.get("content", "") for m in recent_users)
+
+    if not already_saved:
+        memory = append_history(memory, opponent_message=f"[Медиа] {current_user_message}", chat_id=chat_id)
+        save_memory(chat_id, memory)
+
+    return await generate_vision_response(chat_id, thread_id, MULTI_EDIT_PROMPT,
+                                           current_user_message, images_b64, user_id=user_id)
 
 def _compose_video_system_prompt(duration: int = None) -> str:
     """
@@ -783,6 +809,25 @@ def _load_comfy_workflow(filename: str):
 workflow_t2v_video = _load_comfy_workflow('video_ltx2_3_t2v.json')  # текст -> видео
 workflow_i2v_video = _load_comfy_workflow('video_ltx2_3_i2v.json')  # картинка -> видео
 workflow_t2i = _load_comfy_workflow('workflow_t2i.json')      # текст -> картинка
+workflow_multi = _load_comfy_workflow('flux_multiple_input.json')  # 2 картинки -> 1 результат
+
+def _prune_workflow_to_output(workflow: dict, output_node_id: str) -> dict:
+    """Оставляет только узлы, нужные для выходного узла output_node_id (BFS по связям входов).
+    В multiple-input workflow выкидывает одиночную ветку 75:* — иначе ComfyUI выполнит обе
+    и сгенерит лишнюю картинку."""
+    keep = set()
+    stack = [output_node_id]
+    while stack:
+        node_id = stack.pop()
+        if node_id in keep or node_id not in workflow:
+            continue
+        keep.add(node_id)
+        for value in workflow[node_id].get("inputs", {}).values():
+            # связь в API-формате: [node_id (строка), slot]
+            if (isinstance(value, list) and len(value) == 2
+                    and isinstance(value[0], str) and value[0] in workflow):
+                stack.append(value[0])
+    return {node_id: workflow[node_id] for node_id in workflow if node_id in keep}
 
 # ID узла с шириной/высотой в workflow_t2i.json (узел EmptyLatentImage, например "57:5").
 # Если оставить None — узел ищется автоматически (первый, у которого в inputs есть width и height).
@@ -887,6 +932,28 @@ def submit_edit_comfy(prompt_text: str, image_bytes: bytes):
     random_seed = random.randint(0, 2**53 - 1)
     workflow["75:73"]["inputs"]["noise_seed"] = random_seed
     return _submit_comfy_workflow(workflow), random_seed
+    
+def submit_multi_edit_comfy(prompt_text: str, image1_bytes: bytes, image2_bytes: bytes):
+    """Две картинки -> одна через multiple-input workflow. Возвращает (prompt_id, seed)."""
+    if workflow_multi is None:
+        raise RuntimeError("ComfyUI: flux_multiple_input.json не загружен.")
+
+    img1_name = upload_image_to_comfy(image1_bytes)
+    img2_name = upload_image_to_comfy(image2_bytes)
+    if not img1_name or not img2_name:
+        raise RuntimeError("ComfyUI: не удалось загрузить одну из картинок.")
+
+    workflow = json.loads(json.dumps(workflow_multi))
+    workflow = _prune_workflow_to_output(workflow, "94")  # оставляем только multiple-ветку
+
+    workflow["92:109"]["inputs"]["text"] = prompt_text   # промт
+    workflow["76"]["inputs"]["image"] = img1_name        # image1
+    workflow["81"]["inputs"]["image"] = img2_name        # image2
+
+    random_seed = random.randint(0, 2**53 - 1)
+    workflow["92:106"]["inputs"]["noise_seed"] = random_seed
+
+    return _submit_comfy_workflow(workflow), random_seed
 
 def submit_video_t2v_comfy(prompt_text: str, width: int = 360, height: int = 640, duration: int = 10):
     """t2v: готовит workflow и ставит в очередь. Возвращает (prompt_id, seed)."""
@@ -922,7 +989,8 @@ def submit_video_i2v_comfy(prompt_text: str, image_bytes: bytes, width: int = 36
 
 def upload_image_to_comfy(image_bytes: bytes):
     """Загружает картинку в ComfyUI. Возвращает её имя во внутреннем хранилище."""
-    files = {'image': ('temp_image.jpg', image_bytes, 'image/jpeg')}
+    unique_name = f"tg_{uuid.uuid4().hex[:12]}.jpg"
+    files = {'image': (unique_name, image_bytes, 'image/jpeg')}
     try:
         response = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=60)
     except requests.exceptions.RequestException as e:
@@ -934,6 +1002,155 @@ def upload_image_to_comfy(image_bytes: bytes):
             return f"{data['subfolder']}/{data['name']}"
         return data['name']
     return None
+
+# --- Буфер альбомов (Telegram шлёт альбом как N сообщений с общим media_group_id) ---
+album_buffer: dict = {}  # (chat_id, media_group_id) -> {"messages": [], "task": ...}
+
+@main_router.message(F.photo, lambda m: m.media_group_id is not None)
+async def handle_album(message: aiogram_types.Message):
+    """Ловит все фото альбома, копит и после паузы обрабатывает группу целиком."""
+    key = (message.chat.id, message.media_group_id)
+    entry = album_buffer.setdefault(key, {"messages": [], "task": None})
+
+    if any(m.message_id == message.message_id for m in entry["messages"]):
+        return  # защита от дублей
+    entry["messages"].append(message)
+
+    if entry["task"]:
+        entry["task"].cancel()
+    entry["task"] = asyncio.create_task(_flush_album(key))
+
+
+async def _flush_album(key, delay: float = 1.5):
+    """Ждёт delay сек после последнего фото группы, затем роутит альбом."""
+    await asyncio.sleep(delay)
+    entry = album_buffer.pop(key, None)
+    if not entry:
+        return
+    messages = entry["messages"]
+    first = messages[0]
+    try:
+        await _process_album(messages)
+    except Exception as e:
+        print(f"Ошибка обработки альбома: {e}")
+        thread_id = first.message_thread_id if first.is_topic_message else None
+        await send_log_to_telegram(str(e), "Album", first.chat.id, thread_id,
+                                   first.from_user.full_name if first.from_user else "")
+
+async def _process_multi_edit(messages: list, caption: str):
+    """Две картинки + «нарисуй»: local → flux_multiple_input, online → AirForce с двумя image_urls."""
+    first = messages[0]
+    chat_id = first.chat.id
+    thread_id = first.message_thread_id if first.is_topic_message else None
+    user = first.from_user
+    user_name = user.full_name if user else "Пользователь"
+    user_id = user.id if user else None
+    status_msg = None
+
+    raw_caption = caption.lower()
+    cleaned_caption, _ = extract_resolution(raw_caption)
+    request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
+    if not request_text:
+        request_text = "совмести эти две картинки: перенеси стиль и элементы из image2 в image1"
+    prompt_text = f'{user_name}: {request_text}'
+
+    current_image_model = get_image_model(chat_id)
+
+    try:
+        # Скачиваем первые две картинки альбома
+        files = []
+        for m in messages[:2]:
+            file = await bot.get_file(m.photo[-1].file_id)
+            files.append((await bot.download_file(file.file_path)).read())
+        encoded_images = [base64.b64encode(b).decode('utf-8') for b in files]
+
+        if current_image_model == "local":
+            comfy_online = await asyncio.to_thread(is_comfyui_online)
+            if not comfy_online:
+                await first.reply(f"🖥❌ Генератор временно отключён, попробуй позже.", parse_mode="Markdown")
+                return
+
+            # Промт пишет vision-модель, видя ОБЕ картинки
+            await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+            detailed_prompt = await generate_multi_edit_prompt(chat_id, thread_id, prompt_text, encoded_images, user_id=user_id)
+
+            prompt_id, used_seed = await asyncio.to_thread(submit_multi_edit_comfy, detailed_prompt, files[0], files[1])
+            position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
+            status_msg = await first.answer(
+                f"⌛ Совмещаю две твои картинки.\n{_format_queue_info(position, running)}Может занять до 10 мин..."
+            )
+            await bot.send_chat_action(chat_id, "upload_photo", message_thread_id=thread_id)
+
+            photo_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
+            await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(photo_bytes, filename="comfy_multi.png"), message_thread_id=thread_id)
+            await first.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n🌱 Seed: {used_seed}")
+        else:
+            status_msg = await first.answer("⌛ Совмещаю две твои картинки (может занять до 10 мин)...")
+
+            imgbb_urls = []
+            for b in files:
+                url = await asyncio.to_thread(upload_to_imgbb, b, None, chat_id, thread_id)
+                if not url:
+                    raise Exception("Не удалось загрузить одну из картинок на хостинг")
+                imgbb_urls.append(url)
+
+            detailed_prompt = await generate_multi_edit_prompt(chat_id, thread_id, prompt_text, encoded_images, user_id=user_id)
+            await asyncio.sleep(65)
+
+            path = await asyncio.to_thread(generate_media_sync, user_id, detailed_prompt, chat_id, thread_id,
+                                           image_url=imgbb_urls)
+            if path:
+                path = upload_to_imgbb(None, path, chat_id, thread_id)
+                await bot.send_photo(chat_id=chat_id, photo=path, message_thread_id=thread_id)
+                await first.answer(f"📝 Промт:\n\n{detailed_prompt}")
+
+    except Exception as e:
+        print(f"Ошибка multiple edit: {e}")
+        await send_log_to_telegram(str(e), "Multi_Edit", chat_id, thread_id, user_name)
+    finally:
+        if status_msg:
+            await status_msg.delete()
+
+async def _process_album(messages: list):
+    """Роутинг альбома по содержимому подписи."""
+    first = messages[0]
+    caption = next((m.caption for m in messages if m.caption), None)
+    caption_lower = (caption or "").lower()
+    captioned_msg = next((m for m in messages if m.caption), first)
+
+    has_image_cmd = IMAGE_TRIGGER_COMMAND in caption_lower
+    has_video_cmd = VIDEO_TRIGGER_COMMAND in caption_lower
+    triggered = CHAT_TRIGGER_WORD in caption_lower
+    
+    # НОВОЕ: команды генерации — только со СВОИМ триггер-словом.
+    # Важен порядок: сначала это, потом приват-проверка для vision.
+    if (has_image_cmd or has_video_cmd) and not triggered:
+        return  # команда адресована другому боту — выходим, не генерим
+
+    # 1. Не наша команда — сохраняем старое поведение (vision по подписи)
+    if not (has_image_cmd or has_video_cmd):
+        if triggered or first.chat.type == ChatType.PRIVATE:
+            # [Медиа]-запись в память, как это делал monitor_all_messages
+            memory = load_memory(first.chat.id)
+            for m in messages:
+                if m.caption:
+                    memory = append_history(memory, opponent_message=format_message_text(m), chat_id=first.chat.id)
+            save_memory(first.chat.id, memory)
+            await handle_photo_vision(captioned_msg)
+        return
+
+    # 2. Анимация — i2v по фото с подписью (первому)
+    if has_video_cmd:
+        await handle_video_from_photo(captioned_msg)
+        return
+
+    # 3. «нарисуй» + 2 и более фото → multiple-input workflow
+    if len(messages) >= 2:
+        await _process_multi_edit(messages, caption)
+        return
+
+    # 4. «нарисуй» + одно фото в альбоме → обычное одиночное редактирование
+    await handle_photo_edit_request(captioned_msg)
 
 @main_router.message(F.photo, lambda m: m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
 async def handle_photo_edit_request(message: aiogram_types.Message):

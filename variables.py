@@ -27,6 +27,7 @@ COMFY_URL = os.getenv('COMFY_URL', 'http://192.168.0.4:8188')  # порт 8188 �
 IMAGE_PROMPT = prompt.PUPS_IMAGE
 VIDEO_TRIGGER_COMMAND = "анимируй"
 VIDEO_PROMPT = prompt.PUPS_VIDEO
+MULTI_EDIT_PROMPT = prompt.PUPS_MULTI_EDIT
 
 session = AiohttpSession(timeout=300)
 bot = Bot(
