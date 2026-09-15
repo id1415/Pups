@@ -25,7 +25,8 @@ from utils import (load_memory, save_memory, append_history, clear_memory,
                    save_chat_model, save_image_model, save_vision_model, save_music_model, 
                    load_chat_settings, load_image_settings, load_vision_settings, load_music_settings,
                    get_chat_log, save_chat_log, clear_chat_log, # для функции пересказа
-                   save_chat_max_history)
+                   save_chat_max_history,
+                   get_prompt_enhancer_state, save_prompt_enhancer_state, load_prompt_settings)
 from summary import is_summary_enabled, set_summary_state, process_pupps_summary, daily_summary_executor
 from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_COMMAND, PROMPT, MAX_RETRIES, RETRY_DELAY,
                        AIRFORCE_API_URL, AIRFORCE_API_KEY, IMGBB_API_KEY, PUPS_BOT_TOKEN, bot, API_KEY_GEMINI,
@@ -37,12 +38,16 @@ import pupps_info
 import get_models_info
 from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video, process_voice_turn
 
+IGNORED_BOT_IDS = {
+    8718490988,  # Замените на реальный числовой ID целевого бота
+}
 commands = ['нейро инфо', 'нейро name', 'нейро prompt', 'нейро chat', 'нейро vision', 'нейро image', 'нейро music', 'нейро start', 'нейро stop', 'нейро 0',
             'кибер инфо', 'кибер name', 'кибер prompt', 'кибер chat', 'кибер vision', 'кибер image', 'кибер music', 'кибер start', 'кибер stop', 'кибер 0',
             'пупс инфо', 'пупс chat', 'пупс vision', 'пупс image', 'пупс music', 'пупс start', 'пупс stop', 'пупс 0',
             'няша инфо', 'няша chat', 'няша vision', 'няша image', 'няша music', 'няша start', 'няша stop', 'няша 0',
             'пупс context', 'няша context', 'нейро context', 'кибер context',
             'пупс image local', 'пупс image airforce', 'няша image local', 'няша image airforce',
+            'пупс prompt off', 'пупс prompt on', 'пупс prompt', 'няша prompt off', 'няша prompt on', 'няша prompt',
             ]
 
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
@@ -182,6 +187,28 @@ async def generate_music_prompt(chat_id, thread_id, current_user_message, user_i
     return await _generate_media_prompt(chat_id, thread_id, current_user_message,
                                         _compose_music_system_prompt(language, duration),
                                         user_id=user_id)
+
+def extract_seed(text: str):
+    """
+    Пользовательский сид: seed=123, seed:123, сид=123 (регистр любой).
+    Возвращает (очищенный_текст, seed) или (текст, None).
+    Сид вырезается из текста — LLM его не увидит и не утащит в промт.
+    """
+    match = re.search(r'\b(?:seed|сид)\s*[=:]\s*(\d{1,16})\b', text, re.IGNORECASE)
+    if not match:
+        return text, None
+
+    seed = int(match.group(1)) % (2**53)  # тот же диапазон, что у random.randint в сабмитах
+
+    cleaned_text = text[:match.start()] + text[match.end():]
+    cleaned_text = " ".join(cleaned_text.split())
+    return cleaned_text, seed
+
+def _pick_seed(user_seed=None) -> int:
+    """Пользовательский сид или случайный — единая точка для всех workflow."""
+    if user_seed is not None:
+        return int(user_seed)
+    return random.randint(0, 2**53 - 1)
 
 def extract_video_aspect_ratio(text: str):
     """Ищет соотношение сторон для видео (1:1, 2:3, ..., 21:9). Возвращает (текст_без_него, ratio)."""
@@ -632,6 +659,27 @@ def _sync_vision_request(chat_id: int, thread_id: int, system_prompt: str, curre
                 continue
             raise RuntimeError(f"Ошибка после {MAX_RETRIES} попыток: {e}")
             
+async def generate_flf2v_prompt(chat_id, thread_id, current_user_message, images_b64: list,
+                                user_id=None, duration=None):
+    """Промт для видео-перехода между двумя кадрами: vision-модель видит оба + контекст чата."""
+    memory = load_memory(chat_id)
+    request_core = current_user_message.split(":", 1)[-1].strip()
+    recent_users = [m for m in memory.get("history", [])[-6:] if m.get("role") == "user"]
+    already_saved = bool(request_core) and any(request_core in m.get("content", "") for m in recent_users)
+
+    if not already_saved:
+        memory = append_history(memory, opponent_message=f"[Медиа] {current_user_message}", chat_id=chat_id)
+        save_memory(chat_id, memory)
+        
+    # Улучшатель выключен — сырой запрос уходит в генератор напрямую
+    if not get_prompt_enhancer_state(chat_id):
+        return request_core
+
+    return await generate_vision_response(chat_id, thread_id,
+                                          _compose_video_system_prompt(duration),
+                                          current_user_message, images_b64,
+                                          user_id=user_id)
+            
 async def _generate_media_prompt(chat_id, thread_id, current_user_message, system_prompt, user_id=None):
     """Универсальный генератор промтов (картинки/видео): текущая чат-модель + контекст чата."""
     chat_model = get_chat_model(chat_id)
@@ -645,6 +693,10 @@ async def _generate_media_prompt(chat_id, thread_id, current_user_message, syste
     if not already_saved:
         memory = append_history(memory, opponent_message=current_user_message, chat_id=chat_id)
         save_memory(chat_id, memory)
+    
+    # Улучшатель выключен — сырой запрос уходит в генератор напрямую
+    if not get_prompt_enhancer_state(chat_id):
+        return request_core
 
     if chat_model == "gemini":
         user_key = load_gemini_user_key(user_id)
@@ -691,6 +743,10 @@ async def generate_video_i2v_prompt(chat_id: int,
     if not already_saved:
         memory = append_history(memory, opponent_message=f"[Медиа] {current_user_message}", chat_id=chat_id)
         save_memory(chat_id, memory)
+        
+    # Улучшатель выключен — сырой запрос уходит в генератор напрямую
+    if not get_prompt_enhancer_state(chat_id):
+        return request_core
 
     # 2. Генерация через vision-модель (управляется командой "пупс vision ...")
     return await generate_vision_response(chat_id, thread_id, _compose_video_system_prompt(duration),
@@ -714,6 +770,10 @@ async def generate_edit_prompt(chat_id: int,
     if not already_saved:
         memory = append_history(memory, opponent_message=f"[Медиа] {current_user_message}", chat_id=chat_id)
         save_memory(chat_id, memory)
+        
+    # Улучшатель выключен — сырой запрос уходит в генератор напрямую
+    if not get_prompt_enhancer_state(chat_id):
+        return request_core
 
     return await generate_vision_response(chat_id, thread_id, EDIT_PROMPT,
                                           current_user_message, encoded_image,
@@ -729,6 +789,10 @@ async def generate_multi_edit_prompt(chat_id, thread_id, current_user_message, i
     if not already_saved:
         memory = append_history(memory, opponent_message=f"[Медиа] {current_user_message}", chat_id=chat_id)
         save_memory(chat_id, memory)
+        
+    # Улучшатель выключен — сырой запрос уходит в генератор напрямую
+    if not get_prompt_enhancer_state(chat_id):
+        return request_core
 
     return await generate_vision_response(chat_id, thread_id, MULTI_EDIT_PROMPT,
                                            current_user_message, images_b64, user_id=user_id)
@@ -991,6 +1055,7 @@ workflow_i2v_video = _load_comfy_workflow('video_ltx2_5_i2v.json')  # карти
 workflow_t2i = _load_comfy_workflow('workflow_t2i.json')      # текст -> картинка
 workflow_multi = _load_comfy_workflow('flux_multiple_input.json')  # 2 картинки -> 1 результат
 workflow_audio = _load_comfy_workflow('audio_ace_step1_5_xl_turbo.json')  # музыка (ACE-Step 1.5)
+workflow_flf2v_video = _load_comfy_workflow('video_ltx2_5_flf2v.json')  # 2 кадра -> видео (LTX-2.5)
 
 def _prune_workflow_to_output(workflow: dict, output_node_id: str) -> dict:
     """Оставляет только узлы, нужные для выходного узла output_node_id (BFS по связям входов).
@@ -1087,6 +1152,37 @@ def _download_comfy_result(img_url: str) -> bytes:
         raise RuntimeError(f"ComfyUI: не удалось скачать результат (HTTP {img_response.status_code}).")
     return img_response.content
     
+def submit_video_flf2v_comfy(prompt_text: str, first_frame_bytes: bytes, last_frame_bytes: bytes,
+                             aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
+    """Первый и последний кадр -> видео через ComfyUI (LTX-2.5 flf2v). Возвращает (prompt_id, seed)."""
+    if workflow_flf2v_video is None:
+        raise RuntimeError("ComfyUI: video_ltx2_5_flf2v.json не загружен.")
+
+    first_name = upload_image_to_comfy(first_frame_bytes)
+    last_name = upload_image_to_comfy(last_frame_bytes)
+    if not first_name or not last_name:
+        raise RuntimeError("ComfyUI: не удалось загрузить один из кадров.")
+
+    first_frame_node_id = "31"      # LoadImage "Load First Frame"
+    last_frame_node_id = "39"       # LoadImage "Load Last Frame"
+    prompt_node_id = "251:252"      # PrimitiveStringMultiline "Prompt"
+    selector_node_id = "259"        # ResolutionSelector
+    duration_node_id = "251:198"    # PrimitiveInt "Duration"
+    noise_node_id = "251:196"       # RandomNoise
+
+    workflow = json.loads(json.dumps(workflow_flf2v_video))
+    workflow[first_frame_node_id]["inputs"]["image"] = first_name
+    workflow[last_frame_node_id]["inputs"]["image"] = last_name
+    workflow[prompt_node_id]["inputs"]["value"] = prompt_text
+    workflow[selector_node_id]["inputs"]["aspect_ratio"] = _map_aspect_ratio_to_comfy(aspect_ratio)
+    workflow[selector_node_id]["inputs"]["megapixels"] = 0.3
+    workflow[duration_node_id]["inputs"]["value"] = duration
+
+    used_seed = _pick_seed(seed)
+    workflow[noise_node_id]["inputs"]["noise_seed"] = used_seed
+
+    return _submit_comfy_workflow(workflow), used_seed
+    
 def submit_music_comfy(tags: str, lyrics: str, duration: int = 180, language: str = "ru"):
     """Музыка через ComfyUI (ACE-Step 1.5 XL Turbo). Возвращает (prompt_id, seed)."""
     if workflow_audio is None:
@@ -1113,7 +1209,7 @@ def submit_music_comfy(tags: str, lyrics: str, duration: int = 180, language: st
 
     return _submit_comfy_workflow(workflow), random_seed
     
-def submit_image_comfy(prompt_text: str, width: int = 768, height: int = 1024):
+def submit_image_comfy(prompt_text: str, width: int = 768, height: int = 1024, seed: int = None):
     """t2i: готовит workflow и ставит в очередь. Возвращает (prompt_id, seed)."""
     if workflow_t2i is None:
         raise RuntimeError("ComfyUI: workflow_t2i.json не загружен.")
@@ -1121,12 +1217,13 @@ def submit_image_comfy(prompt_text: str, width: int = 768, height: int = 1024):
     workflow["57:27"]["inputs"]["text"] = prompt_text
     if not _set_workflow_resolution(workflow, width, height):
         raise RuntimeError("ComfyUI: не найден узел с width/height — впиши ID в LATENT_NODE_ID.")
-    random_seed = random.randint(0, 2**53 - 1)
-    workflow["57:3"]["inputs"]["seed"] = random_seed
-    workflow["57:3"]["inputs"]["control_after_generate"] = "randomize"
-    return _submit_comfy_workflow(workflow), random_seed
+    used_seed = _pick_seed(seed)
+    workflow["57:3"]["inputs"]["seed"] = used_seed
+    # Пользовательский сид фиксируем, иначе ComfyUI рандомизирует его после генерации
+    workflow["57:3"]["inputs"]["control_after_generate"] = "fixed" if seed is not None else "randomize"
+    return _submit_comfy_workflow(workflow), used_seed
 
-def submit_edit_comfy(prompt_text: str, image_bytes: bytes):
+def submit_edit_comfy(prompt_text: str, image_bytes: bytes, seed: int = None):
     """i2i: готовит workflow и ставит в очередь. Возвращает (prompt_id, seed)."""
     if workflow_edit is None:
         raise RuntimeError("ComfyUI: flux_image_edit.json не загружен.")
@@ -1136,11 +1233,11 @@ def submit_edit_comfy(prompt_text: str, image_bytes: bytes):
     workflow = json.loads(json.dumps(workflow_edit))
     workflow["75:74"]["inputs"]["text"] = prompt_text
     workflow["76"]["inputs"]["image"] = image_filename
-    random_seed = random.randint(0, 2**53 - 1)
-    workflow["75:73"]["inputs"]["noise_seed"] = random_seed
-    return _submit_comfy_workflow(workflow), random_seed
+    used_seed = _pick_seed(seed)
+    workflow["75:73"]["inputs"]["noise_seed"] = used_seed
+    return _submit_comfy_workflow(workflow), used_seed
     
-def submit_multi_edit_comfy(prompt_text: str, image1_bytes: bytes, image2_bytes: bytes):
+def submit_multi_edit_comfy(prompt_text: str, image1_bytes: bytes, image2_bytes: bytes, seed: int = None):
     """Две картинки -> одна через multiple-input workflow. Возвращает (prompt_id, seed)."""
     if workflow_multi is None:
         raise RuntimeError("ComfyUI: flux_multiple_input.json не загружен.")
@@ -1157,12 +1254,12 @@ def submit_multi_edit_comfy(prompt_text: str, image1_bytes: bytes, image2_bytes:
     workflow["76"]["inputs"]["image"] = img1_name        # image1
     workflow["81"]["inputs"]["image"] = img2_name        # image2
 
-    random_seed = random.randint(0, 2**53 - 1)
-    workflow["92:106"]["inputs"]["noise_seed"] = random_seed
+    used_seed = _pick_seed(seed)
+    workflow["92:106"]["inputs"]["noise_seed"] = used_seed
 
-    return _submit_comfy_workflow(workflow), random_seed
+    return _submit_comfy_workflow(workflow), used_seed
 
-def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10):
+def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
     """Текст -> видео через ComfyUI (LTX-2.5). duration=0 — модель сама подбирает длительность.
     Возвращает (prompt_id, seed)."""
     if workflow_t2v_video is None:
@@ -1179,14 +1276,14 @@ def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_A
     workflow[selector_node_id]["inputs"]["megapixels"] = 0.3
     workflow[duration_node_id]["inputs"]["value"] = duration
 
-    random_seed = random.randint(0, 2**53 - 1)
+    used_seed = _pick_seed(seed)
     for node_id in noise_node_ids:
-        workflow[node_id]["inputs"]["noise_seed"] = random_seed
+        workflow[node_id]["inputs"]["noise_seed"] = used_seed
 
-    return _submit_comfy_workflow(workflow), random_seed
+    return _submit_comfy_workflow(workflow), used_seed
 
 def submit_video_i2v_comfy(prompt_text: str, image_bytes: bytes,
-                           aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10):
+                           aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
     """Картинка -> видео через ComfyUI (LTX-2.5). duration=0 — модель сама подбирает.
     Возвращает (prompt_id, seed)."""
     if workflow_i2v_video is None:
@@ -1220,11 +1317,11 @@ def submit_video_i2v_comfy(prompt_text: str, image_bytes: bytes,
     resize_inputs["resize_type.crop"] = "center"
     resize_inputs.pop("resize_type.longer_size", None)
 
-    random_seed = random.randint(0, 2**53 - 1)
+    used_seed = _pick_seed(seed)
     for node_id in noise_node_ids:
-        workflow[node_id]["inputs"]["noise_seed"] = random_seed
+        workflow[node_id]["inputs"]["noise_seed"] = used_seed
 
-    return _submit_comfy_workflow(workflow), random_seed
+    return _submit_comfy_workflow(workflow), used_seed
 
 def upload_image_to_comfy(image_bytes: bytes):
     """Загружает картинку в ComfyUI. Возвращает её имя во внутреннем хранилище."""
@@ -1276,6 +1373,75 @@ async def _flush_album(key, delay: float = 1.5):
         await send_log_to_telegram(str(e), "Album", first.chat.id, thread_id,
                                    first.from_user.full_name if first.from_user else "")
 
+async def _process_flf2v(messages: list, caption: str):
+    """Альбом из 2+ фото с «анимируй»: первый кадр -> последний кадр -> видео."""
+    first = messages[0]
+    chat_id = first.chat.id
+    thread_id = first.message_thread_id if first.is_topic_message else None
+    user = first.from_user
+    user_name = user.full_name if user else "Пользователь"
+    user_id = user.id if user else None
+    status_msg = None
+
+    raw_caption = caption.lower()
+    cleaned_caption, user_seed = extract_seed(raw_caption)
+    cleaned_caption, aspect_ratio = extract_video_aspect_ratio(raw_caption)
+    cleaned_caption, duration = extract_video_duration(cleaned_caption)
+    request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
+    prompt_text = f'{user_name}: {request_text}' if request_text else \
+                  f'{user_name}: придумай плавный и эффектный переход от первого кадра ко второму'
+
+    aspect_ratio = aspect_ratio or DEFAULT_VIDEO_ASPECT
+    duration = duration if duration is not None else 10
+
+    try:
+        comfy_online = await asyncio.to_thread(is_comfyui_online)
+        if not comfy_online:
+            await first.reply(f"🖥❌ Генератор временно отключён, попробуй позже.")
+            return
+
+        # Скачиваем первые два фото альбома: 1-е = первый кадр, 2-е = последний
+        files = []
+        for m in messages[:2]:
+            file = await bot.get_file(m.photo[-1].file_id)
+            files.append((await bot.download_file(file.file_path)).read())
+        encoded_images = [base64.b64encode(b).decode('utf-8') for b in files]
+
+        # Vision-модель видит оба кадра; роли кадров указываем в сообщении
+        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+        flf_context = (f"{prompt_text}\n\n"
+                       f"=== КАДРЫ ===\n"
+                       f"image1 (первое присланное фото) — ПЕРВЫЙ кадр видео.\n"
+                       f"image2 (второе присланное фото) — ПОСЛЕДНИЙ кадр видео.")
+        detailed_prompt = await generate_flf2v_prompt(chat_id, thread_id, flf_context, encoded_images,
+                                                      user_id=user_id, duration=duration)
+
+        prompt_id, used_seed = await asyncio.to_thread(submit_video_flf2v_comfy, detailed_prompt,
+                                                        files[0], files[1], aspect_ratio, duration, user_seed)
+        position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
+
+        duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
+        status_msg = await first.answer(
+            f"⌛ Анимирую переход между твоими кадрами ({aspect_ratio}, {duration_text}).\n"
+            f"{_format_queue_info(position, running)}Это надолго, жди..."
+        )
+        await bot.send_chat_action(chat_id, "upload_video", message_thread_id=thread_id)
+
+        print(f'Генерация видео FLF2V ({aspect_ratio}, {duration_text})...')
+        video_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
+
+        await send_video_to_chat(chat_id, thread_id, video_bytes)
+        seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
+        await first.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration_text} | 🌱 Seed: {seed_text}")
+        print('Готово!')
+
+    except Exception as e:
+        print(f"Ошибка flf2v: {e}")
+        await send_log_to_telegram(str(e), "Video_FLF2V", chat_id, thread_id, user_name)
+    finally:
+        if status_msg:
+            await status_msg.delete()
+
 async def _process_multi_edit(messages: list, caption: str):
     """Две картинки + «нарисуй»: local → flux_multiple_input, online → AirForce с двумя image_urls."""
     first = messages[0]
@@ -1287,6 +1453,7 @@ async def _process_multi_edit(messages: list, caption: str):
     status_msg = None
 
     raw_caption = caption.lower()
+    cleaned_caption, user_seed = extract_seed(raw_caption)
     cleaned_caption, _ = extract_resolution(raw_caption)
     request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
     if not request_text:
@@ -1313,7 +1480,7 @@ async def _process_multi_edit(messages: list, caption: str):
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             detailed_prompt = await generate_multi_edit_prompt(chat_id, thread_id, prompt_text, encoded_images, user_id=user_id)
 
-            prompt_id, used_seed = await asyncio.to_thread(submit_multi_edit_comfy, detailed_prompt, files[0], files[1])
+            prompt_id, used_seed = await asyncio.to_thread(submit_multi_edit_comfy, detailed_prompt, files[0], files[1], user_seed)
             position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
             status_msg = await first.answer(
                 f"⌛ Совмещаю две твои картинки.\n{_format_queue_info(position, running)}Может занять до 10 мин..."
@@ -1322,7 +1489,8 @@ async def _process_multi_edit(messages: list, caption: str):
 
             photo_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
             await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(photo_bytes, filename="comfy_multi.png"), message_thread_id=thread_id)
-            await first.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n🌱 Seed: {used_seed}")
+            seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
+            await first.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n🌱 Seed: {seed_text}")
         else:
             status_msg = await first.answer("⌛ Совмещаю две твои картинки (может занять до 10 мин)...")
 
@@ -1380,7 +1548,10 @@ async def _process_album(messages: list):
 
     # 2. Анимация — i2v по фото с подписью (первому)
     if has_video_cmd:
-        await handle_video_from_photo(captioned_msg)
+        if len(messages) >= 2:
+            await _process_flf2v(messages, caption)
+        else:
+            await handle_video_from_photo(captioned_msg)
         return
 
     # 3. «нарисуй» + 2 и более фото → multiple-input workflow
@@ -1391,6 +1562,43 @@ async def _process_album(messages: list):
     # 4. «нарисуй» + одно фото в альбоме → обычное одиночное редактирование
     await handle_photo_edit_request(captioned_msg)
 
+async def _is_chat_admin(message: aiogram_types.Message) -> bool:
+    if message.chat.type == "private":
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        return member.status in ["creator", "administrator"]
+    except Exception:
+        return False
+
+@main_router.message(F.text.lower() == f"{CHAT_TRIGGER_WORD} prompt off")
+async def handle_prompt_enhancer_off(message: aiogram_types.Message):
+    save_prompt_enhancer_state(message.chat.id, False)
+    await message.reply(
+        f"🔌 Улучшатель промтов ВЫКЛЮЧЕН для этого чата.\n\n"
+        f"Промт теперь уходит в генератор как есть, без нейронки. "
+        f"Для лучшего качества пиши запрос сразу на английском.\n\n"
+        f"Включить обратно: `{CHAT_TRIGGER_WORD} prompt on`",
+        parse_mode="Markdown"
+    )
+
+@main_router.message(F.text.lower() == f"{CHAT_TRIGGER_WORD} prompt on")
+async def handle_prompt_enhancer_on(message: aiogram_types.Message):
+    save_prompt_enhancer_state(message.chat.id, True)
+    await message.reply(
+        f"🔌 Улучшатель промтов снова ВКЛЮЧЕН — нейронка пишет промты за тебя.",
+    )
+
+@main_router.message(F.text.lower() == f"{CHAT_TRIGGER_WORD} prompt")
+async def handle_prompt_enhancer_status(message: aiogram_types.Message):
+    state = get_prompt_enhancer_state(message.chat.id)
+    state_text = "🟢 ВКЛЮЧЕН — нейронка улучшает промты" if state else "🔴 ВЫКЛЮЧЕН — промты идут как есть"
+    await message.reply(
+        f"Улучшатель промтов в этом чате: {state_text}\n\n"
+        f"Управление: `{CHAT_TRIGGER_WORD} prompt on` / `{CHAT_TRIGGER_WORD} prompt off`",
+        parse_mode="Markdown"
+    )
+
 @main_router.message(F.photo, lambda m: m.caption and f'{CHAT_TRIGGER_WORD}' in m.caption.lower() and IMAGE_TRIGGER_COMMAND in m.caption.lower())
 async def handle_photo_edit_request(message: aiogram_types.Message):
     chat_id = message.chat.id
@@ -1398,6 +1606,7 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
     thread_id = message.message_thread_id if message.is_topic_message else None
     user_name = message.from_user.full_name
     raw_caption = message.caption.lower()
+    cleaned_caption, user_seed = extract_seed(raw_caption)
     cleaned_caption, aspect_ratio = extract_aspect_ratio(raw_caption)
     request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}'
@@ -1426,7 +1635,7 @@ async def handle_photo_edit_request(message: aiogram_types.Message):
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             detailed_prompt = await generate_edit_prompt(chat_id, thread_id, prompt_text, encoded_image, user_id=user_id)
 
-            prompt_id, used_seed = await asyncio.to_thread(submit_edit_comfy, detailed_prompt, file_bytes)
+            prompt_id, used_seed = await asyncio.to_thread(submit_edit_comfy, detailed_prompt, file_bytes, user_seed)
             position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
 
             status_msg = await message.answer(
@@ -1470,7 +1679,8 @@ async def handle_video_generation(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     user_id = message.from_user.id
     raw_text = message.text.lower()
-    cleaned_text, aspect_ratio = extract_video_aspect_ratio(raw_text)
+    cleaned_text, user_seed = extract_seed(raw_text)
+    cleaned_text, aspect_ratio = extract_video_aspect_ratio(cleaned_text)
     cleaned_text, duration = extract_video_duration(cleaned_text)
     request_text = cleaned_text.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}'
@@ -1496,7 +1706,7 @@ async def handle_video_generation(message: aiogram_types.Message):
         detailed_prompt = await generate_video_prompt(chat_id, thread_id, prompt_text, user_id=user_id, duration=duration)
 
         # 2. Постановка в очередь
-        prompt_id, used_seed = await asyncio.to_thread(submit_video_t2v_comfy, detailed_prompt, aspect_ratio, duration)
+        prompt_id, used_seed = await asyncio.to_thread(submit_video_t2v_comfy, detailed_prompt, aspect_ratio, duration, user_seed)
         duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
 
         # 3. Первое и единственное статус-сообщение — сразу с очередью
@@ -1513,7 +1723,8 @@ async def handle_video_generation(message: aiogram_types.Message):
         video_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
 
         await send_video_to_chat(chat_id, thread_id, video_bytes)
-        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration} сек | 🌱 Seed: {used_seed}")
+        seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
+        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration} сек | 🌱 Seed: {seed_text}")
         print('Готово!')
 
     except Exception as e:
@@ -1528,7 +1739,8 @@ async def handle_image_generation(message: aiogram_types.Message):
     user_name = message.from_user.full_name
     user_id = message.from_user.id
     raw_text = message.text.lower()
-    cleaned_text, resolution = extract_resolution(raw_text)          # <-- НОВОЕ: сначала вырезаем разрешение
+    cleaned_text, user_seed = extract_seed(raw_text)
+    cleaned_text, resolution = extract_resolution(cleaned_text)          # <-- НОВОЕ: сначала вырезаем разрешение
     cleaned_text, aspect_ratio = extract_aspect_ratio(cleaned_text)  # потом соотношение (для онлайн-пути)
     request_text = cleaned_text.replace(CHAT_TRIGGER_WORD, '').replace(IMAGE_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}'
@@ -1554,7 +1766,7 @@ async def handle_image_generation(message: aiogram_types.Message):
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             detailed_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
 
-            prompt_id, used_seed = await asyncio.to_thread(submit_image_comfy, detailed_prompt, width, height)
+            prompt_id, used_seed = await asyncio.to_thread(submit_image_comfy, detailed_prompt, width, height, user_seed)
             position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
 
             status_msg = await message.answer(
@@ -1564,7 +1776,8 @@ async def handle_image_generation(message: aiogram_types.Message):
 
             photo_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
             await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(photo_bytes, filename="comfy_image.png"), message_thread_id=thread_id)
-            await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {width}x{height} | 🌱 Seed: {used_seed}")
+            seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
+            await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {width}x{height} | 🌱 Seed: {seed_text}")
         else:
             status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
             detailed_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
@@ -1880,6 +2093,7 @@ async def handle_video_from_photo(message: aiogram_types.Message):
     thread_id = message.message_thread_id if message.is_topic_message else None
     user_name = message.from_user.full_name
     raw_caption = message.caption.lower()
+    cleaned_caption, user_seed = extract_seed(raw_caption)
     cleaned_caption, aspect_ratio = extract_video_aspect_ratio(raw_caption)
     cleaned_caption, duration = extract_video_duration(cleaned_caption)
     request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
@@ -1906,7 +2120,7 @@ async def handle_video_from_photo(message: aiogram_types.Message):
                                                            encoded_image, user_id=user_id, duration=duration)
 
         prompt_id, used_seed = await asyncio.to_thread(submit_video_i2v_comfy, detailed_prompt, file_bytes,
-                                                        aspect_ratio, duration)
+                                                        aspect_ratio, duration, user_seed)
 
         position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
         duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
@@ -1920,7 +2134,8 @@ async def handle_video_from_photo(message: aiogram_types.Message):
         video_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
 
         await send_video_to_chat(chat_id, thread_id, video_bytes)
-        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration_text} | 🌱 Seed: {used_seed}")
+        seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
+        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration_text} | 🌱 Seed: {seed_text}")
         print('Готово!')
 
     except Exception as e:
@@ -2432,16 +2647,8 @@ class HistoryMiddleware(BaseMiddleware):
         if event.from_user and event.from_user.id == bot.id:
             return
             
-        IGNORED_USERS = {5305038935, 8320108709, 1467812279}
-            
-        # --- БЛОК АВТОМАТИЧЕСКОЙ РЕАКЦИИ ---
-        user_id = event.from_user.id if event.from_user else None
-        if chat_id == -1002232705531 and topic_id == 196220 and user_id not in IGNORED_USERS: # -1002232705531 and topic_id == 196220:
-            try:
-                await event.react([aiogram_types.ReactionTypeEmoji(emoji='💩')])
-            except Exception as e:
-                print(f"❌ Не удалось поставить реакцию: {e}")
-        # ----------------------------------
+        if event.from_user and event.from_user.id in IGNORED_BOT_IDS:
+            return
 
         # Форматируем текст сообщения (поддерживает медиа)
         prefix = "[Медиа] " if (event.photo or event.video or event.animation or event.document) else ""
@@ -2497,6 +2704,7 @@ async def main():
     load_image_settings()
     load_vision_settings()
     load_music_settings()
+    load_prompt_settings()
     
     dp.message.outer_middleware(HistoryMiddleware())
     main_router.message.register(cmd_start, CommandStart())

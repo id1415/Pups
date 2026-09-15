@@ -19,8 +19,36 @@ IMAGE_SETTINGS_FILE = "image_settings.json"
 image_settings_cache = {}
 MUSIC_SETTINGS_FILE = "music_settings.json"
 music_settings_cache = {}
+PROMPT_SETTINGS_FILE = "prompt_settings.json"
+prompt_settings_cache = {}
 MAX_HISTORY_GEMINI = 500
 MAX_HISTORY_AIRFORCE = 150
+
+def get_prompt_enhancer_state(chat_id: int) -> bool:
+    """True — улучшатель промтов включён (дефолт). False — промт идёт в генератор как есть."""
+    cid = str(chat_id)
+    if cid in prompt_settings_cache:
+        return prompt_settings_cache[cid].get("enhancer_enabled", True)
+    return True
+
+def save_prompt_enhancer_state(chat_id: int, enabled: bool):
+    cid = str(chat_id)
+    if cid not in prompt_settings_cache:
+        prompt_settings_cache[cid] = {"trigger_word": CHAT_TRIGGER_WORD}
+    prompt_settings_cache[cid]["enhancer_enabled"] = enabled
+    with open(PROMPT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(prompt_settings_cache, f, ensure_ascii=False, indent=4)
+
+def load_prompt_settings():
+    global prompt_settings_cache
+    if os.path.exists(PROMPT_SETTINGS_FILE):
+        try:
+            with open(PROMPT_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                prompt_settings_cache = json.load(f)
+        except Exception:
+            prompt_settings_cache = {}
+    else:
+        prompt_settings_cache = {}
 
 def _get_fernet():
     """Инициализирует объект шифрования, если ключ задан."""
