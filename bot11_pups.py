@@ -188,6 +188,22 @@ async def generate_music_prompt(chat_id, thread_id, current_user_message, user_i
                                         _compose_music_system_prompt(language, duration),
                                         user_id=user_id)
 
+def extract_megapixels(text: str):
+    """
+    Пользовательский megapixels: mp=1, mp=1.9, mp:0.5 (регистр любой, точка или запятая).
+    Диапазон 0.2–2.0. Возвращает (очищенный_текст, mp) или (текст, None).
+    """
+    match = re.search(r'\bmp\s*[=:]\s*(\d+(?:[.,]\d+)?)\b', text, re.IGNORECASE)
+    if not match:
+        return text, None
+
+    mp = float(match.group(1).replace(',', '.'))
+    mp = max(0.2, min(2.0, mp))
+
+    cleaned_text = text[:match.start()] + text[match.end():]
+    cleaned_text = " ".join(cleaned_text.split())
+    return cleaned_text, mp
+
 def extract_seed(text: str):
     """
     Пользовательский сид: seed=123, seed:123, сид=123 (регистр любой).
@@ -242,6 +258,35 @@ def _get_resolution_selector_options():
     except Exception as e:
         print(f"ComfyUI: не удалось получить варианты aspect_ratio: {e}")
     return None
+
+DEFAULT_VIDEO_MP = 0.3
+_mp_options_cache = None
+
+def _resolve_mp(mp) -> float:
+    """None -> дефолт; защита от null в workflow."""
+    return float(mp) if mp is not None else DEFAULT_VIDEO_MP
+
+def _get_mp_options():
+    """Допустимые значения megapixels узла ResolutionSelector из /object_info (кэшируется)."""
+    global _mp_options_cache
+    if _mp_options_cache is not None:
+        return _mp_options_cache
+    try:
+        data = requests.get(f"{COMFY_URL}/object_info/ResolutionSelector", timeout=10).json()
+        mp_input = data.get("ResolutionSelector", {}).get("input", {}).get("required", {}).get("megapixels")
+        if mp_input and isinstance(mp_input[0], list):
+            _mp_options_cache = sorted(float(x) for x in mp_input[0])
+            return _mp_options_cache
+    except Exception as e:
+        print(f"ComfyUI: не удалось получить варианты megapixels: {e}")
+    return None
+
+def _clamp_mp_to_options(mp: float) -> float:
+    """Прижимает mp к ближайшему допустимому значению узла (если список известен)."""
+    options = _get_mp_options()
+    if not options:
+        return mp
+    return min(options, key=lambda x: abs(x - mp))
 
 def _map_aspect_ratio_to_comfy(ratio: str) -> str:
     """'16:9' -> '16:9 (Widescreen)' — точное значение для узла 409."""
@@ -1153,7 +1198,8 @@ def _download_comfy_result(img_url: str) -> bytes:
     return img_response.content
     
 def submit_video_flf2v_comfy(prompt_text: str, first_frame_bytes: bytes, last_frame_bytes: bytes,
-                             aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
+                             aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None,
+                             mp: float = None):
     """Первый и последний кадр -> видео через ComfyUI (LTX-2.5 flf2v). Возвращает (prompt_id, seed)."""
     if workflow_flf2v_video is None:
         raise RuntimeError("ComfyUI: video_ltx2_5_flf2v.json не загружен.")
@@ -1175,7 +1221,7 @@ def submit_video_flf2v_comfy(prompt_text: str, first_frame_bytes: bytes, last_fr
     workflow[last_frame_node_id]["inputs"]["image"] = last_name
     workflow[prompt_node_id]["inputs"]["value"] = prompt_text
     workflow[selector_node_id]["inputs"]["aspect_ratio"] = _map_aspect_ratio_to_comfy(aspect_ratio)
-    workflow[selector_node_id]["inputs"]["megapixels"] = 0.3
+    workflow[selector_node_id]["inputs"]["megapixels"] = _resolve_mp(mp)
     workflow[duration_node_id]["inputs"]["value"] = duration
 
     used_seed = _pick_seed(seed)
@@ -1259,7 +1305,8 @@ def submit_multi_edit_comfy(prompt_text: str, image1_bytes: bytes, image2_bytes:
 
     return _submit_comfy_workflow(workflow), used_seed
 
-def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
+def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None,
+                             mp: float = None):
     """Текст -> видео через ComfyUI (LTX-2.5). duration=0 — модель сама подбирает длительность.
     Возвращает (prompt_id, seed)."""
     if workflow_t2v_video is None:
@@ -1273,7 +1320,7 @@ def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_A
     workflow = json.loads(json.dumps(workflow_t2v_video))
     workflow[prompt_node_id]["inputs"]["value"] = prompt_text
     workflow[selector_node_id]["inputs"]["aspect_ratio"] = _map_aspect_ratio_to_comfy(aspect_ratio)
-    workflow[selector_node_id]["inputs"]["megapixels"] = 0.3
+    workflow[selector_node_id]["inputs"]["megapixels"] = _resolve_mp(mp)
     workflow[duration_node_id]["inputs"]["value"] = duration
 
     used_seed = _pick_seed(seed)
@@ -1283,7 +1330,8 @@ def submit_video_t2v_comfy(prompt_text: str, aspect_ratio: str = DEFAULT_VIDEO_A
     return _submit_comfy_workflow(workflow), used_seed
 
 def submit_video_i2v_comfy(prompt_text: str, image_bytes: bytes,
-                           aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None):
+                           aspect_ratio: str = DEFAULT_VIDEO_ASPECT, duration: int = 10, seed: int = None,
+                             mp: float = None):
     """Картинка -> видео через ComfyUI (LTX-2.5). duration=0 — модель сама подбирает.
     Возвращает (prompt_id, seed)."""
     if workflow_i2v_video is None:
@@ -1304,7 +1352,7 @@ def submit_video_i2v_comfy(prompt_text: str, image_bytes: bytes,
     workflow[load_image_node_id]["inputs"]["image"] = image_filename
     workflow[prompt_node_id]["inputs"]["value"] = prompt_text
     workflow[selector_node_id]["inputs"]["aspect_ratio"] = _map_aspect_ratio_to_comfy(aspect_ratio)
-    workflow[selector_node_id]["inputs"]["megapixels"] = 0.3
+    workflow[selector_node_id]["inputs"]["megapixels"] = _resolve_mp(mp)
     workflow[duration_node_id]["inputs"]["value"] = duration
 
     # Приводим картинку к выбранному соотношению (как в 2.3): точные размеры
@@ -1387,6 +1435,7 @@ async def _process_flf2v(messages: list, caption: str):
     cleaned_caption, user_seed = extract_seed(raw_caption)
     cleaned_caption, aspect_ratio = extract_video_aspect_ratio(raw_caption)
     cleaned_caption, duration = extract_video_duration(cleaned_caption)
+    cleaned_caption, mp = extract_megapixels(cleaned_caption)
     request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}' if request_text else \
                   f'{user_name}: придумай плавный и эффектный переход от первого кадра ко второму'
@@ -1417,7 +1466,7 @@ async def _process_flf2v(messages: list, caption: str):
                                                       user_id=user_id, duration=duration)
 
         prompt_id, used_seed = await asyncio.to_thread(submit_video_flf2v_comfy, detailed_prompt,
-                                                        files[0], files[1], aspect_ratio, duration, user_seed)
+                                                        files[0], files[1], aspect_ratio, duration, user_seed, mp)
         position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
 
         duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
@@ -1682,6 +1731,7 @@ async def handle_video_generation(message: aiogram_types.Message):
     cleaned_text, user_seed = extract_seed(raw_text)
     cleaned_text, aspect_ratio = extract_video_aspect_ratio(cleaned_text)
     cleaned_text, duration = extract_video_duration(cleaned_text)
+    cleaned_text, mp = extract_megapixels(cleaned_text)
     request_text = cleaned_text.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}'
     chat_id = message.chat.id
@@ -1706,7 +1756,7 @@ async def handle_video_generation(message: aiogram_types.Message):
         detailed_prompt = await generate_video_prompt(chat_id, thread_id, prompt_text, user_id=user_id, duration=duration)
 
         # 2. Постановка в очередь
-        prompt_id, used_seed = await asyncio.to_thread(submit_video_t2v_comfy, detailed_prompt, aspect_ratio, duration, user_seed)
+        prompt_id, used_seed = await asyncio.to_thread(submit_video_t2v_comfy, detailed_prompt, aspect_ratio, duration, user_seed, mp)
         duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
 
         # 3. Первое и единственное статус-сообщение — сразу с очередью
@@ -2096,6 +2146,7 @@ async def handle_video_from_photo(message: aiogram_types.Message):
     cleaned_caption, user_seed = extract_seed(raw_caption)
     cleaned_caption, aspect_ratio = extract_video_aspect_ratio(raw_caption)
     cleaned_caption, duration = extract_video_duration(cleaned_caption)
+    cleaned_caption, mp = extract_megapixels(cleaned_caption)
     request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '').replace(VIDEO_TRIGGER_COMMAND, '').strip()
     prompt_text = f'{user_name}: {request_text}' if request_text else \
                   f'{user_name}: оживи это изображение — придумай естественное движение и звук, сохраняя суть сцены'
@@ -2120,7 +2171,7 @@ async def handle_video_from_photo(message: aiogram_types.Message):
                                                            encoded_image, user_id=user_id, duration=duration)
 
         prompt_id, used_seed = await asyncio.to_thread(submit_video_i2v_comfy, detailed_prompt, file_bytes,
-                                                        aspect_ratio, duration, user_seed)
+                                                        aspect_ratio, duration, user_seed, mp)
 
         position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
         duration_text = f"{duration} сек" if duration else "длительность выберет нейронка"
