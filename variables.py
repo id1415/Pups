@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.bot import DefaultBotProperties
+from aiogram.enums import ParseMode
 from google import genai
 
 import prompt
@@ -38,7 +39,9 @@ session = AiohttpSession(timeout=300)
 bot = Bot(
     token=PUPS_BOT_TOKEN,
     session=session,
-    default=DefaultBotProperties()
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.MARKDOWN
+    )
 )
 
 client = genai.Client(

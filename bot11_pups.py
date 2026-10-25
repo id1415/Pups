@@ -12,10 +12,11 @@ import speech_recognition as sr
 from pydub import AudioSegment
 import io
 from bot_dialogue import dialogue_router
+from tg_helpers import send_message_safe
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram import BaseMiddleware
 from aiogram.filters import CommandStart, Filter
-from aiogram import Dispatcher, Router, types as aiogram_types, F
+from aiogram import Dispatcher, Router, types as aiogram_types, F, BaseMiddleware
 from aiogram.types import Message, BufferedInputFile
 from aiogram.enums import ParseMode, ChatType
 from google.genai import types
@@ -390,13 +391,27 @@ async def send_log_to_telegram(error_message: str, handler_name: str, chat_id: i
     full_log_message = f'❌ {user_info}, ошибка в обработчике {handler_name}:\n\n{safe_error}'
     
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            text=full_log_message
-        )
+        # send_message_safe: ретраи при сетевых сбоях + фолбэк без Markdown,
+        # чтобы лог об ошибках сам не падал из-за разметки в тексте ошибки
+        await send_message_safe(bot, chat_id, full_log_message, message_thread_id=thread_id)
     except Exception as e:
         print(f"Ошибка: Не удалось отправить лог в Telegram. {e}")
+
+async def _send_chunks_safe(message: aiogram_types.Message, chunks: list):
+    """Шлёт длинный текст по кускам через send_message_safe
+    (фолбэк при ошибке Markdown + ретраи при сетевых сбоях)."""
+    chat_id = message.chat.id
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    first = True
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        if first:
+            await send_message_safe(bot, chat_id, chunk, message_thread_id=thread_id,
+                                    reply_to_message_id=message.message_id)
+            first = False
+        else:
+            await send_message_safe(bot, chat_id, chunk, message_thread_id=thread_id)
         
 # Функция для определения наличия медиа и добавления префикса
 def format_message_text(message: aiogram_types.Message) -> str:
@@ -470,7 +485,9 @@ async def generate_response(chat_id: int,
     if chat_model == "gemini":
         user_key = load_gemini_user_key(user_id)
         active_key = user_key if user_key else API_KEY_GEMINI
-        return await gemini_priem(chat_id, current_user_message, user_key=active_key)
+        # system_prompt теперь передаётся дальше, а не молча заменялся дефолтным PROMPT
+        return await gemini_priem(chat_id, current_user_message, user_key=active_key,
+                                  system_prompt=system_prompt)
     else:
         user_key = load_airforce_user_key(user_id)
         active_key = user_key if user_key else AIRFORCE_API_KEY
@@ -497,6 +514,16 @@ def _sync_airforce_request(chat_id: int, thread_id: int, system_prompt: str, cur
              
         if role in ["user", "assistant"] and content: 
             messages_to_send.append({"role": role, "content": content})
+    
+    # Некоторые модели плохо отвечают, когда диалог заканчивается репликой ассистента
+    # (так бывает в авто-режиме, где current_user_message пустой).
+    # Добавляем служебную реплику пользователя, чтобы модель продолжила диалог.
+    if messages_to_send[-1]["role"] == "assistant":
+        tail = current_user_message.strip() or (
+            "Твоя очередь написать сообщение в этот чат от своего имени: "
+            "поделись мыслью, идеей или темой для обсуждения."
+        )
+        messages_to_send.append({"role": "user", "content": tail})
     
     payload = {
       "model": chat_model,
@@ -575,7 +602,9 @@ def _sync_airforce_request(chat_id: int, thread_id: int, system_prompt: str, cur
                 time.sleep(RETRY_DELAY)
                 continue
             raise RuntimeError(f"Ошибка после {MAX_RETRIES} попыток: {e}")
-    raise RuntimeError("Не удалось получить ответ.")
+    raise RuntimeError(
+        f"Не удалось получить ответ от модели {chat_model} после {MAX_RETRIES} попыток."
+    )
     
 async def generate_vision_response(chat_id: int,
                                    thread_id: int,
@@ -1710,7 +1739,12 @@ async def handle_video_generation(message: aiogram_types.Message):
 
         await send_video_to_chat(chat_id, thread_id, video_bytes)
         seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
-        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration} сек | 🌱 Seed: {seed_text}")
+        # detailed_prompt генерит модель — там часто попадаются * и _, ломающие Markdown
+        await send_message_safe(
+            bot, chat_id,
+            f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration} сек | 🌱 Seed: {seed_text}",
+            message_thread_id=thread_id
+        )
         print('Готово!')
 
     except Exception as e:
@@ -1763,7 +1797,11 @@ async def handle_image_generation(message: aiogram_types.Message):
             photo_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
             await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(photo_bytes, filename="comfy_image.png"), message_thread_id=thread_id)
             seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
-            await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {width}x{height} | 🌱 Seed: {seed_text}")
+            await send_message_safe(
+                bot, chat_id,
+                f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {width}x{height} | 🌱 Seed: {seed_text}",
+                message_thread_id=thread_id
+            )
         else:
             status_msg = await message.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
             detailed_prompt = await generate_image_prompt(chat_id, thread_id, prompt_text, user_id=user_id)
@@ -1776,7 +1814,8 @@ async def handle_image_generation(message: aiogram_types.Message):
                 print('Отправка в тг...')
                 path = upload_to_imgbb(None, path, chat_id, thread_id)
                 await bot.send_photo(chat_id=chat_id, photo=path, message_thread_id=thread_id)
-                await message.answer(f"📝 Промт:\n\n{detailed_prompt}")
+                await send_message_safe(bot, chat_id, f"📝 Промт:\n\n{detailed_prompt}",
+                                        message_thread_id=thread_id)
 
         print('Готово!')
 
@@ -1834,13 +1873,7 @@ async def handle_set_chat_model(message: aiogram_types.Message):
         )
         chunks = split_by_lines(full_text, max_length=4000)
         
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
-                continue
-            if i == 0:
-                await message.reply(chunk, parse_mode="Markdown")
-            else:
-                await message.answer(chunk, parse_mode="Markdown")
+        await _send_chunks_safe(message, chunks)
         return
         
     chosen_model = parts[2].strip().lower()
@@ -1883,13 +1916,7 @@ async def handle_set_music_model(message: aiogram_types.Message):
         
         chunks = split_by_lines(full_text, max_length=4000)
         
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
-                continue
-            if i == 0:
-                await message.reply(chunk, parse_mode="Markdown")
-            else:
-                await message.answer(chunk, parse_mode="Markdown")
+        await _send_chunks_safe(message, chunks)
         return
         
     chosen_model = parts[2].strip().lower()
@@ -1922,13 +1949,7 @@ async def handle_set_vision_model(message: aiogram_types.Message):
         
         chunks = split_by_lines(full_text, max_length=4000)
         
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
-                continue
-            if i == 0:
-                await message.reply(chunk, parse_mode="Markdown")
-            else:
-                await message.answer(chunk, parse_mode="Markdown")
+        await _send_chunks_safe(message, chunks)
         return
         
         return
@@ -1979,13 +2000,7 @@ async def handle_set_image_model(message: aiogram_types.Message):
         
         chunks = split_by_lines(full_text, max_length=4000)
         
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():  # Пропускаем пустые куски, если они возникнут
-                continue
-            if i == 0:
-                await message.reply(chunk, parse_mode="Markdown")
-            else:
-                await message.answer(chunk, parse_mode="Markdown")
+        await _send_chunks_safe(message, chunks)
         return
         
         return
@@ -2035,7 +2050,7 @@ async def handle_video_vision(message: aiogram_types.Message):
         # 2. Скачиваем файл
         print('Загрузка видео файла...')
         file = await bot.get_file(video_obj.file_id)
-        file_bytes = await bot.download_file(file.file_path)
+        file_bytes = await bot.download_file(file.file_path, timeout=600)
         
         # 💡 ВАЖНО: Сбрасываем каретку BytesIO в начало перед чтением
         file_bytes.seek(0)
@@ -2045,7 +2060,7 @@ async def handle_video_vision(message: aiogram_types.Message):
             raise ValueError("Скачанный файл видео оказался пустым (0 байт).")
 
         # 3. Кодируем в base64
-        encoded_video = base64.b64encode(raw_bytes).decode('utf-8')
+        #encoded_video = base64.b64encode(raw_bytes).decode('utf-8')
         
         # Определяем mime_type (для video_note это обычно video/mp4)
         mime_type = getattr(message.video, 'mime_type', None) or "video/mp4"
@@ -2053,8 +2068,9 @@ async def handle_video_vision(message: aiogram_types.Message):
         # 4. Отправляем в Gemini
         user_key = load_gemini_user_key(user_id)
         active_key = user_key if user_key else API_KEY_GEMINI
-        response = await gemini_priem_video(chat_id, text, encoded_video, mime_type=mime_type, user_key=active_key)
-        await message.reply(response)
+        response = await gemini_priem_video(chat_id, text, raw_bytes, mime_type=mime_type, user_key=active_key)
+        await send_message_safe(bot, chat_id, response, message_thread_id=thread_id,
+                                reply_to_message_id=message.message_id)
         
         if is_summary_enabled(chat_id):
                 bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
@@ -2122,7 +2138,11 @@ async def handle_video_from_photo(message: aiogram_types.Message):
 
         await send_video_to_chat(chat_id, thread_id, video_bytes)
         seed_text = f"{used_seed}" if user_seed is not None else str(used_seed)
-        await message.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration_text} | 🌱 Seed: {seed_text}")
+        await send_message_safe(
+            bot, chat_id,
+            f"📝 Промт:\n\n{detailed_prompt}\n\n📐 {aspect_ratio} | ⏱ {duration_text} | 🌱 Seed: {seed_text}",
+            message_thread_id=thread_id
+        )
         print('Готово!')
 
     except Exception as e:
@@ -2165,7 +2185,8 @@ async def handle_photo_vision(message: aiogram_types.Message):
             user_id=user_id
         )
         
-        await message.reply(response)
+        await send_message_safe(bot, chat_id, response, message_thread_id=thread_id,
+                                reply_to_message_id=message.message_id)
         
         if is_summary_enabled(chat_id):
                 bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
@@ -2303,7 +2324,8 @@ async def handle_music_generation(message: aiogram_types.Message):
         if user_text:
             path = await asyncio.to_thread(generate_media_sync, user_id, prompt_text, chat_id, thread_id, is_music=True)
             print('Отправка в тг...')
-            await message.reply(f"Ссылка на файл:\n{path}")
+            await send_message_safe(bot, chat_id, f"Ссылка на файл:\n{path}",
+                                    message_thread_id=thread_id)
             print('Готово!')
 
     except Exception as e:
@@ -2370,8 +2392,7 @@ async def handle_music_generation(message: aiogram_types.Message):
 
         info_text = (f"🏷 Тэги:\n{tags}\n\n🎤 Лирика:\n{lyrics}\n\n"
                      f"⏱ {duration} сек | 🌐 {language} | 🌱 Seed: {used_seed}")
-        for chunk in split_by_lines(info_text, max_length=4000):
-            await message.answer(chunk)
+        await _send_chunks_safe(message, split_by_lines(info_text, max_length=4000))
 
         print('Готово!')
 
@@ -2484,12 +2505,25 @@ async def handle_voice_message(message: aiogram_types.Message):
             save_memory(chat_id, memory)
 
             # 5. Отправка голосового сообщения с текстом в описании
-            voice_file = BufferedInputFile(response_voice_io.read(), filename="voice_answer.ogg")
+            voice_bytes = response_voice_io.getvalue()
             if len(response_text) <= 1024:
-                await message.reply_voice(voice=voice_file, caption=response_text)
+                try:
+                    await message.reply_voice(
+                        voice=BufferedInputFile(voice_bytes, filename="voice_answer.ogg"),
+                        caption=response_text
+                    )
+                except TelegramBadRequest as e:
+                    # Markdown в подписи не разобрался — шлём голос без подписи, текст отдельно
+                    print(f"⚠️ Подпись голосового не прошла ({e}), отправляю текст отдельным сообщением.")
+                    await message.reply_voice(
+                        voice=BufferedInputFile(voice_bytes, filename="voice_answer.ogg")
+                    )
+                    await send_message_safe(bot, chat_id, response_text, message_thread_id=thread_id)
             else:
-                await message.reply_voice(voice=voice_file)
-                await message.reply(response_text)
+                await message.reply_voice(
+                    voice=BufferedInputFile(voice_bytes, filename="voice_answer.ogg")
+                )
+                await send_message_safe(bot, chat_id, response_text, message_thread_id=thread_id)
 
             # Сохраняем в лог для пересказа (саммари)
             if is_summary_enabled(chat_id):
@@ -2543,7 +2577,9 @@ async def monitor_all_messages(message: aiogram_types.Message):
         try:
             await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
             response = await generate_response(chat_id, thread_id, PROMPT, text_to_ai, user_id=user_id)
-            await bot.send_message(chat_id, response, message_thread_id=thread_id, reply_to_message_id=message.message_id)
+            # send_message_safe: ретраи при сетевых сбоях + фолбэк, если ответ не прошёл как Markdown
+            await send_message_safe(bot, chat_id, response, message_thread_id=thread_id,
+                                    reply_to_message_id=message.message_id)
             
             if is_summary_enabled(chat_id):
                 bot_name = CHAT_TRIGGER_WORD.capitalize() # или имя бота
@@ -2703,4 +2739,4 @@ async def main():
     await restore_dialogues(bot)
     
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot)

@@ -84,6 +84,7 @@ async def restore_dialogues(bot: Bot):
 async def send_dialogue_message(chat_id: int, topic_id: int, bot: Bot):
     """Фоновая задача: запрашивает ответ у ИИ и отправляет его в текущий топик/чат"""
     from bot11_pups import generate_response
+    from tg_helpers import send_message_safe
 
     try:
         # Запрашиваем генерацию. Контекст автоматически подтягивается из chat_memories.
@@ -95,11 +96,21 @@ async def send_dialogue_message(chat_id: int, topic_id: int, bot: Bot):
         )
 
         if response_text:
-            # Отправляем сообщение обратно в тот же топик (если topic_id=None, отправится в корень чата)
-            await bot.send_message(chat_id, response_text, message_thread_id=topic_id)
-            
+            # Отправляем сообщение обратно в тот же топик (если topic_id=None, отправится в корень чата).
+            # send_message_safe: несколько попыток при сетевых сбоях (Cannot connect to api.telegram.org)
+            # и автоматический фолбэк, если ответ не прошёл как Markdown.
+            await send_message_safe(bot, chat_id, response_text, message_thread_id=topic_id)
+        else:
+            logger.warning(f"Авто режим: модель вернула пустой ответ (чат {chat_id}, топик {topic_id}).")
+
     except Exception as e:
-        logger.error(f"Ошибка авто режима в чате {chat_id}, топик {topic_id}: {e}")
+        # Теперь в логе видно КОНКРЕТНУЮ причину: тип ошибки + полный traceback.
+        # RuntimeError от Gemini/AirForce уже содержит текст последней ошибки API.
+        logger.error(
+            f"Ошибка авто режима в чате {chat_id}, топик {topic_id}: "
+            f"{type(e).__name__}: {e}",
+            exc_info=True
+        )
 
 # --- Новые фильтры команд без ID топика ---
 
@@ -218,4 +229,4 @@ async def stop_dialogue_cmd(message: aiogram_types.Message):
         save_dialogue_config(config)
         await message.reply("🛑 Режим авто сообщений остановлен.")
     else:
-        await message.reply("В данном чате режим авто сообщений не был запущен.")
+        await message.reply("В данном чате режим авто сообщений не был запущен.")

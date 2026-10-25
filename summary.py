@@ -6,6 +6,7 @@ from datetime import datetime
 import pytz
 from aiogram.types import BufferedInputFile
 from utils import get_chat_log, clear_chat_log
+from tg_helpers import send_message_safe, send_photo_safe
 from variables import PROMPT, CHAT_TRIGGER_WORD, bot, WORKER_URL, WORKER_API_KEY
 import gemini
 
@@ -90,10 +91,13 @@ async def process_pupps_summary(chat_id: int, log_data: list, thread_id: int = N
         summary = await gemini.priem_summary(summary_system_prompt)
         print(summary)
         
-        await bot.send_message(
-            chat_id=chat_id, 
-            message_thread_id=thread_id,
-            text=f"🔥 **{CHAT_TRIGGER_WORD.upper()} ПОЯСНЯЕТ ЗА ПРОШЕДШИЙ БАЗАР:**\n\n{summary}"
+        # send_message_safe: если разметка не разберётся — уйдёт текстом без форматирования.
+        # *...* вместо **...** — legacy Markdown в Telegram понимает одиночные звёздочки
+        await send_message_safe(
+            bot,
+            chat_id,
+            f"🔥 *{CHAT_TRIGGER_WORD.upper()} ПОЯСНЯЕТ ЗА ПРОШЕДШИЙ БАЗАР:*\n\n{summary}",
+            message_thread_id=thread_id
         )
         clear_chat_log(chat_id)
     except Exception as e:
@@ -118,11 +122,12 @@ async def process_pupps_summary(chat_id: int, log_data: list, thread_id: int = N
         image_bytes = await generate_worker_image(image_prompt)
         if image_bytes:
             buffered_file = BufferedInputFile(image_bytes, filename="summary_illustration.png")
-            await bot.send_photo(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
+            await send_photo_safe(
+                bot,
+                chat_id,
                 photo=buffered_file,
-                caption=f"🎨 **Иллюстрация прошедшего дня:**\n`{image_prompt}`"
+                caption=f"🎨 *Иллюстрация прошедшего дня:*\n`{image_prompt}`",
+                message_thread_id=thread_id
             )
         else:
             print("Не удалось получить изображение от Cloudflare Worker.")
@@ -154,8 +159,9 @@ async def daily_summary_executor():
             if not log_data:
                 set_summary_state(chat_id, False)
                 try:
-                    await bot.send_message(
-                        chat_id=chat_id, 
+                    await send_message_safe(
+                        bot,
+                        chat_id,
                         message_thread_id=thread_id,
                         text=f'Слышь, вы че, вымерли тут все? За весь день ни одной живой души. Короче, я тушу пересказ, ловить тут нечего. Если будет базар, админ введи команду "{CHAT_TRIGGER_WORD} вкл пересказ" заново. А пока идите траву трогайте, мудаки!'
                     )
@@ -168,4 +174,4 @@ async def daily_summary_executor():
                 await asyncio.sleep(5)
             except Exception as e:
                 print(f"Ошибка при обработке очереди саммари для {chat_id}: {e}")
-                continue
+                continue
