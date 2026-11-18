@@ -4,15 +4,31 @@
 Закрывает две проблемы:
 1. Сетевые сбои (ClientConnectorError: Cannot connect to host api.telegram.org)
    -> делается несколько попыток отправки с паузой.
-2. Ошибки Markdown-разметки ("Can't parse entities...")
+2. Ошибки Markdown-разметки ("Can't parse entities: Can't find end of the entity...")
    -> три ступени отправки:
       0) обычная отправка с лёгким ремонтом разметки (незакрытый блок ``` и т.п.);
-      1) экранирование спецсимволов Markdown — текст отображается "как есть",
-         без форматирования, но без потери символов;
-      2) грубая зачистка символов разметки (последний рубеж).
+      1) текст КАК ЕСТЬ и с ЯВНЫМ parse_mode=None — Телега не парсит его вообще;
+      2) зачистка символов разметки + тоже parse_mode=None (последний рубеж).
 
-parse_mode=ParseMode.MARKDOWN в variables.py (DefaultBotProperties) остаётся как был —
-фолбэки применяются только к конкретной отправке, ничего глобально не меняется.
+ВАЖНО: в ступенях 1-2 parse_mode=None передаётся ЯВНО, а не «просто не передаётся».
+У бота в variables.py стоит DefaultBotProperties(parse_mode=ParseMode.MARKDOWN):
+если parse_mode не передать вовсе, aiogram подставит дефолт бота — и Телега
+снова будет парсить Markdown. Явный None перекрывает дефолт, поэтому текст
+доходит целиком: и [Verse 1], и _подчёркивания_, и бэктики из лирики.
+
+Почему прежняя схема (escape/strip с дефолтным parse_mode) не работала:
+- escape_markdown ставил "\\" перед спецсимволами, но LEGACY Markdown (в отличие
+  от MarkdownV2) экранирование через "\\" НЕ поддерживает — сообщение ломалось так же;
+- strip_markdown выкидывал * _ ` но НЕ скобки [ ] — а в лирике повсюду
+  [Verse 1] / [Chorus] / [Instrumental]: незакрытая "[" для legacy Markdown —
+  это незакрытая ссылка, отсюда "Can't find end of the entity starting at ...".
+
+ПЛЮС ГЛАВНОЕ: в variables.py (DefaultBotProperties) теперь parse_mode=None —
+глобального Markdown-парсинга больше нет вообще, поэтому ЛЮБАЯ отправка в проекте
+(bot_dialogue.py, summary.py, message.reply без parse_mode и т.д.) больше не может
+упасть с "can't parse entities". Форматирование возвращается только там, где оно
+нужно: ступень 0 send_message_safe шлёт с ЯВНЫМ "Markdown" и при ошибке разметки
+автоматически повторяет без неё.
 """
 import asyncio
 import logging
@@ -45,7 +61,12 @@ def repair_markdown(text: str) -> str:
 
 
 def escape_markdown(text: str) -> str:
-    """Экранирует спецсимволы Markdown — Telegram покажет текст 'как есть'."""
+    """Экранирует спецсимволы Markdown.
+
+    ВНИМАНИЕ: в фолбэках больше НЕ используется — legacy Markdown не понимает
+    экранирование через "\\" (это умеет только MarkdownV2), поэтому экранированный
+    текст ломался так же, как исходный. Оставлена для совместимости.
+    """
     return _MD_ENTITY_RE.sub(r'\\\1', text)
 
 
@@ -59,9 +80,9 @@ async def _send_with_protection(attempt_send, retries: int, retry_delay: float):
     Универсальный конверт отправки.
 
     attempt_send(stage: int) -> Message, где stage:
-        0 — обычная отправка (разметка бота по умолчанию),
-        1 — текст с экранированными спецсимволами,
-        2 — текст без символов разметки.
+        0 — текст с ЯВНЫМ parse_mode="Markdown" (бывший дефолт бота),
+        1 — текст как есть, parse_mode=None (Телега не парсит вообще),
+        2 — текст без символов разметки, parse_mode=None.
     """
     stage = 0
     last_exc = None
@@ -98,6 +119,22 @@ async def _send_with_protection(attempt_send, retries: int, retry_delay: float):
     raise last_exc
 
 
+def _fallback_kwargs(kwargs: dict, stage: int) -> dict:
+    """Копия kwargs для отправки.
+
+    Ступень 0 — parse_mode="Markdown" ЯВНО (глобального дефолта в variables.py
+    больше нет: там parse_mode=None). Явный parse_mode вызывающего уважается.
+    Ступени 1-2 — parse_mode=None ЯВНО: Телега вообще не парсит текст, сломаться
+    нечему. Копия нужна, чтобы словарь вызывающего не мутировал между попытками.
+    """
+    extra = dict(kwargs)
+    if stage == 0:
+        extra.setdefault("parse_mode", "Markdown")
+    else:
+        extra["parse_mode"] = None
+    return extra
+
+
 async def send_message_safe(
     bot: Bot,
     chat_id: int,
@@ -118,7 +155,7 @@ async def send_message_safe(
         if stage == 0:
             payload = repair_markdown(text)
         elif stage == 1:
-            payload = escape_markdown(text)
+            payload = text  # как есть — парсинга нет, ломаться нечему
         else:
             payload = strip_markdown(text) or "…"
 
@@ -126,7 +163,7 @@ async def send_message_safe(
             chat_id=chat_id,
             text=payload,
             message_thread_id=message_thread_id,
-            **kwargs,
+            **_fallback_kwargs(kwargs, stage),
         )
 
     return await _send_with_protection(_attempt, retries, retry_delay)
@@ -151,7 +188,7 @@ async def send_photo_safe(
             if stage == 0:
                 cap = repair_markdown(cap)
             elif stage == 1:
-                cap = escape_markdown(cap)
+                cap = cap  # как есть, парсинг выключен ниже
             else:
                 cap = strip_markdown(cap) or None
 
@@ -160,7 +197,7 @@ async def send_photo_safe(
             photo=photo,
             caption=cap,
             message_thread_id=message_thread_id,
-            **kwargs,
+            **_fallback_kwargs(kwargs, stage),
         )
 
     return await _send_with_protection(_attempt, retries, retry_delay)

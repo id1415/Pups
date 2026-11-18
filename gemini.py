@@ -311,7 +311,7 @@ async def priem(chat_id: int, current_user_message: str, user_key: str = None, s
         f"Последняя ошибка — {type(last_error).__name__}: {last_error}"
     )
 
-
+'''
 async def priem_vision(chat_id: int, current_user_message: str, base64_image: str, user_key: str = None, system_prompt: str = PROMPT) -> str:
     client = _get_gemini_client(user_key)
     memory = load_memory(chat_id)
@@ -379,6 +379,72 @@ async def priem_vision(chat_id: int, current_user_message: str, base64_image: st
         f"Gemini Vision не смог обработать изображение после 5 попыток. "
         f"Последняя ошибка — {type(last_error).__name__}: {last_error}"
     )
+'''
+
+async def priem_vision(chat_id: int, current_user_message: str, base64_image, user_key: str = None, system_prompt: str = PROMPT) -> str:
+    client = _get_gemini_client(user_key)
+    memory = load_memory(chat_id)
+    
+    contents = []
+    for item in memory.get("history", []):
+        role = item.get("role")
+        content = item.get("content")
+        if not content and "parts" in item:
+            content = item["parts"][0]["text"]
+            
+        if role in ["user", "assistant"] and content:
+            gemini_role = "user" if role == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=gemini_role,
+                    parts=[types.Part.from_text(text=content)]
+                )
+            )
+    
+    # Картинок может быть несколько (flf2v, multi-edit) — тогда приходит список
+    images = base64_image if isinstance(base64_image, list) else [base64_image]
+    image_parts = [
+        types.Part.from_bytes(data=base64.b64decode(img), mime_type="image/jpeg")
+        for img in images
+    ]
+    image_parts.append(types.Part.from_text(text=current_user_message))
+    
+    if contents and contents[-1].role == "user":
+        contents.pop()
+    
+    contents.append(
+        types.Content(
+            role="user",
+            parts=image_parts
+        )
+    )
+
+    config = types.GenerateContentConfig(
+        temperature=0.9,
+        system_instruction=system_prompt
+    )
+
+    for attempt in range(5):
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=contents,
+                config=config
+            )
+            
+            if response and response.text and response.text.strip():
+                final_content = response.text.strip()
+                updated_memory = append_history(memory, my_response=final_content)
+                save_memory(chat_id, updated_memory)
+                return final_content
+                
+        except Exception as e:
+            print(f"❌ Ошибка Gemini Vision (попытка {attempt + 1}): {e}")
+            
+        if attempt < 4:
+            await asyncio.sleep(5)
+            
+    raise RuntimeError("Gemini Vision не смог обработать изображение.")
 
 
 # ---------- Хелперы для работы с видео через Files API ----------
@@ -572,3 +638,86 @@ async def priem_video(chat_id: int, current_user_message: str, video_bytes: byte
         f"Gemini не смог разобрать видео после 5 попыток. "
         f"Последняя ошибка — {type(last_error).__name__}: {last_error}"
     )
+
+async def priem_audio(chat_id: int, current_user_message: str, base64_audio: str,
+                      mime_type: str = "audio/mpeg", user_key: str = None,
+                      system_prompt: str = PROMPT) -> str:
+    """
+    Аудио + текст -> ответ модели. Используется в music-2-music: модель
+    СЛУШАЕТ присланный трек и по его анализу пишет TAGS/LYRICS.
+    Полностью повторяет priem_video, только часть данных — аудио.
+    Отличия от текстовых функций: клиент с таймаутом 10 минут (анализ песни —
+    долго), две модели по очереди и логи с типом исключения — у таймаутов и
+    части ошибок API str(e) пустой, иначе в консоли пустота после двоеточия.
+    """
+    client = _get_gemini_client(user_key, timeout_ms=600000)
+    memory = load_memory(chat_id)
+
+    contents = []
+    for item in memory.get("history", []):
+        role = item.get("role")
+        content = item.get("content")
+        if not content and "parts" in item:
+            content = item["parts"][0]["text"]
+
+        if role in ["user", "assistant"] and content:
+            gemini_role = "user" if role == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=gemini_role,
+                    parts=[types.Part.from_text(text=content)]
+                )
+            )
+
+    audio_bytes = base64.b64decode(base64_audio)
+
+    # Последнее сообщение юзера (уже сохранённое в память) придёт заново — уже с аудио
+    if contents and contents[-1].role == "user":
+        contents.pop()
+
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+                types.Part.from_text(text=current_user_message)
+            ]
+        )
+    )
+
+    config = types.GenerateContentConfig(
+        temperature=0.9,
+        system_instruction=system_prompt
+    )
+
+    last_detail = "нет ответа"
+    for attempt in range(5):
+        model = 'gemini-3.5-flash-lite'
+        try:
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+
+            if response and response.text and response.text.strip():
+                final_content = response.text.strip()
+                updated_memory = append_history(memory, my_response=final_content)
+                save_memory(chat_id, updated_memory)
+                return final_content
+
+            last_detail = f"пустой ответ модели {model}"
+
+        except Exception as e:
+            # У таймаутов (httpx/asyncio) и части ошибок API str(e) == '' —
+            # пишем тип исключения, repr и HTTP-код, если есть
+            code = getattr(e, 'code', None)
+            if code is None:
+                code = getattr(getattr(e, 'response', None), 'status_code', None)
+            last_detail = f"{type(e).__name__}: {e!r}" + (f" (HTTP {code})" if code else "")
+            print(f"❌ Ошибка Gemini Audio (попытка {attempt + 1}, модель {model}): {last_detail}")
+
+        if attempt < 4:
+            await asyncio.sleep(5)
+
+    raise RuntimeError(f"Gemini не смог разобрать аудио ({last_detail}).")

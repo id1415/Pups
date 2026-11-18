@@ -34,10 +34,12 @@ from variables import (CHAT_TRIGGER_WORD, IMAGE_TRIGGER_COMMAND, MUSIC_TRIGGER_C
                        client,
                        COMFY_URL, IMAGE_PROMPT,
                        VIDEO_TRIGGER_COMMAND, VIDEO_PROMPT, MULTI_EDIT_PROMPT, EDIT_PROMPT,
-                       MUSIC_PROMPT, DEFAULT_MUSIC_DURATION, DEFAULT_MUSIC_LANGUAGE)
+                       MUSIC_PROMPT, MUSIC_M2M_PROMPT, DEFAULT_MUSIC_DURATION, DEFAULT_MUSIC_LANGUAGE,
+                       DEFAULT_LYRICS_STRENGTH)
 import pupps_info
 import get_models_info
-from gemini import priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video, process_voice_turn
+from gemini import (priem as gemini_priem, priem_vision as gemini_priem_vision, priem_video as gemini_priem_video,
+                    priem_audio as gemini_priem_audio, process_voice_turn)
 
 IGNORED_BOT_IDS = {
     8718490988,  # Замените на реальный числовой ID целевого бота
@@ -125,6 +127,21 @@ def extract_music_duration(text: str):
     cleaned = text[:match.start()] + text[match.end():]
     return " ".join(cleaned.split()), duration
 
+def extract_lyrics_strength(text: str):
+    """
+    Пользовательский lyrics_strength для music-2-music: str=1.9, str:0.5
+    (регистр любой, точка или запятая). Диапазон 0.1–5.0.
+    Если параметра нет — дефолт DEFAULT_LYRICS_STRENGTH (1).
+    Возвращает (очищенный_текст, strength), strength подставляется всегда.
+    """
+    strength = DEFAULT_LYRICS_STRENGTH
+    match = re.search(r'\bstr\s*[=:]\s*(\d+(?:[.,]\d+)?)\b', text, re.IGNORECASE)
+    if match:
+        strength = max(0.1, min(5.0, float(match.group(1).replace(',', '.'))))
+        cleaned = text[:match.start()] + text[match.end():]
+        text = " ".join(cleaned.split())
+    return text, strength
+
 
 def _strip_token(text: str, token: str) -> str:
     cleaned = re.sub(rf'\b{re.escape(token)}\b', '', text, count=1)
@@ -165,7 +182,10 @@ def _parse_music_prompt(response_text: str):
     text = response_text.strip()
     if text.startswith("```"):  # срезаем маркеры кода, если модель их добавила
         text = re.sub(r'^```\w*\s*|\s*```$', '', text).strip()
-    text = text.replace('*', '')  # возможный markdown-жирный вокруг маркеров
+    # Чистим markdown-разметку: модель любит обрамлять маркеры звёздочками/бэктиками
+    # и ставить подчёркивания в тэгах (synth_pop, lo_fi). Незакрытые _ и ` Телега
+    # не парсит: "Bad Request: can't parse entities: Can't find end of the entity".
+    text = text.replace('*', '').replace('`', '').replace('_', ' ')
 
     match = re.search(r'TAGS:\s*(.*?)\s*LYRICS:\s*(.*)', text, re.DOTALL | re.IGNORECASE)
     if match:
@@ -399,19 +419,28 @@ async def send_log_to_telegram(error_message: str, handler_name: str, chat_id: i
 
 async def _send_chunks_safe(message: aiogram_types.Message, chunks: list):
     """Шлёт длинный текст по кускам через send_message_safe
-    (фолбэк при ошибке Markdown + ретраи при сетевых сбоях)."""
+    (фолбэк при ошибке Markdown + ретраи при сетевых сбоях).
+    Если Телега ответила "can't parse entities" (незакрытые _ * ` в тексте) —
+    повторяет тот же кусок без parse_mode, чтобы текст точно дошёл."""
     chat_id = message.chat.id
     thread_id = message.message_thread_id if message.is_topic_message else None
     first = True
     for chunk in chunks:
         if not chunk.strip():
             continue
-        if first:
+        reply_to = message.message_id if first else None
+        try:
             await send_message_safe(bot, chat_id, chunk, message_thread_id=thread_id,
-                                    reply_to_message_id=message.message_id)
-            first = False
-        else:
-            await send_message_safe(bot, chat_id, chunk, message_thread_id=thread_id)
+                                    reply_to_message_id=reply_to)
+        except TelegramBadRequest as e:
+            if "can't parse entities" not in str(e):
+                raise
+            print(f"⚠️ Кусок не прошёл из-за разметки, шлю без Markdown: {e}")
+            # parse_mode=None ЯВНО: у бота дефолт MARKDOWN (DefaultBotProperties),
+            # без явного None aiogram подставит его обратно и снова упадёт на разметке
+            await bot.send_message(chat_id, chunk, message_thread_id=thread_id,
+                                   reply_to_message_id=reply_to, parse_mode=None)
+        first = False
         
 # Функция для определения наличия медиа и добавления префикса
 def format_message_text(message: aiogram_types.Message) -> str:
@@ -1113,6 +1142,7 @@ workflow_t2v_video = _load_comfy_workflow('video_ltx2_5_t2v.json')  # текст
 workflow_i2v_video = _load_comfy_workflow('video_ltx2_5_i2v.json')  # картинка -> видео (LTX-2.5)
 workflow_t2i = _load_comfy_workflow('qwen2.1-t2i.json')      # текст -> картинка
 workflow_audio = _load_comfy_workflow('audio_ace_step1_5_xl_turbo.json')  # музыка (ACE-Step 1.5)
+workflow_audio_m2m = _load_comfy_workflow('audio_ace_step_1_m2m_editing.json')  # music-2-music: переработка готового трека (ACE-Step)
 workflow_flf2v_video = _load_comfy_workflow('video_ltx2_5_flf2v.json')  # 2 кадра -> видео (LTX-2.5)
 
 def _prune_workflow_to_output(workflow: dict, output_node_id: str) -> dict:
@@ -1167,6 +1197,21 @@ def is_comfyui_online(timeout: int = 5) -> bool:
 
 COMFY_MEDIA_KEYS = ('images', 'gifs', 'videos', 'audio')
 
+def _compact_comfy_error(status: dict) -> str:
+    """Короткое человекочитаемое описание ошибки выполнения из status ComfyUI.
+    Полный dict с трейсбеком занимает тысячи символов — в чат шлём суть:
+    узел, его тип и первую строку сообщения об ошибке."""
+    try:
+        for _name, payload in (status.get('messages') or []):
+            if isinstance(payload, dict) and payload.get('exception_message'):
+                node_type = payload.get('node_type', '?')
+                node_id = payload.get('node_id', '?')
+                msg = str(payload['exception_message']).strip().splitlines()[0]
+                return f"узел {node_type} (id {node_id}): {msg}"
+    except Exception:
+        pass
+    return json.dumps(status, ensure_ascii=False)[:300]
+
 def poll_comfyui(prompt_id: str, timeout: int = 3600) -> str:
     """Опрашивает ComfyUI до завершения генерации. По таймауту отменяет задачу."""
     start_time = time.time()
@@ -1186,7 +1231,7 @@ def poll_comfyui(prompt_id: str, timeout: int = 3600) -> str:
             entry = history[prompt_id]
             status = entry.get('status', {})
             if status.get('status_str') == 'error':
-                raise RuntimeError(f"ComfyUI: ошибка выполнения workflow: {status}")
+                raise RuntimeError(f"ComfyUI: ошибка выполнения workflow: {_compact_comfy_error(status)}")
 
             for node_id, node_output in entry.get('outputs', {}).items():
                 for key in COMFY_MEDIA_KEYS:
@@ -1265,6 +1310,30 @@ def submit_music_comfy(tags: str, lyrics: str, duration: int = 180, language: st
     workflow[seed_node_id]["inputs"]["value"] = random_seed
 
     return _submit_comfy_workflow(workflow), random_seed
+
+M2M_ENCODE_NODE_ID = "14"       # TextEncodeAceStepAudio: tags + lyrics + lyrics_strength
+M2M_LOAD_AUDIO_NODE_ID = "64"   # LoadAudio: исходный трек
+M2M_SAMPLER_NODE_ID = "52"      # KSampler: seed
+
+def submit_music_m2m_comfy(tags: str, lyrics: str, audio_filename: str,
+                           lyrics_strength: float = DEFAULT_LYRICS_STRENGTH, seed: int = None):
+    """music-2-music: исходный трек + TAGS/LYRICS -> переработанный трек (ACE-Step).
+    Длительность результата равна длине исходника — латент кодируется из него через VAEEncodeAudio.
+    lyrics_strength — насколько сильно лирика ведёт генерацию (0.1–5).
+    Возвращает (prompt_id, seed)."""
+    if workflow_audio_m2m is None:
+        raise RuntimeError("ComfyUI: audio_ace_step_1_m2m_editing.json не загружен.")
+
+    workflow = json.loads(json.dumps(workflow_audio_m2m))
+    workflow[M2M_ENCODE_NODE_ID]["inputs"]["tags"] = tags
+    workflow[M2M_ENCODE_NODE_ID]["inputs"]["lyrics"] = lyrics
+    workflow[M2M_ENCODE_NODE_ID]["inputs"]["lyrics_strength"] = float(lyrics_strength)
+    workflow[M2M_LOAD_AUDIO_NODE_ID]["inputs"]["audio"] = audio_filename
+
+    used_seed = _pick_seed(seed)
+    workflow[M2M_SAMPLER_NODE_ID]["inputs"]["seed"] = used_seed
+
+    return _submit_comfy_workflow(workflow), used_seed
     
 def submit_image_comfy(prompt_text: str, width: int = 768, height: int = 1024, seed: int = None):
     """t2i: готовит workflow и ставит в очередь. Возвращает (prompt_id, seed)."""
@@ -1407,6 +1476,52 @@ def upload_image_to_comfy(image_bytes: bytes):
         return data['name']
     return None
 
+AUDIO_EXTENSION_BY_MIME = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "application/ogg": ".ogg",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac",
+}
+SUPPORTED_UPLOAD_EXT = {".mp3", ".wav", ".ogg", ".flac"}   # то, что LoadAudio точно переваривает
+
+def upload_audio_to_comfy(audio_bytes: bytes, mime_type: str = "audio/mpeg", original_name: str = None):
+    """Загружает аудио в ComfyUI (нужно для LoadAudio в music-2-music). Возвращает имя файла.
+
+    ВАЖНО: ЛЮБОЕ аудио (даже обычный .mp3) проверяется и перезаписывается в чистый mp3.
+    Причина: слегка битый/обрезанный mp3 CLI-ffmpeg (pydub) декодирует без проблем,
+    а строгий PyAV в узле LoadAudio падает с InvalidDataError (avcodec_send_packet).
+    Перезапись через ffmpeg отдаёт ComfyUI гарантированно целое аудио."""
+    try:
+        audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+    except Exception as e:
+        raise ValueError(
+            f"Не смог прочитать аудиофайл ({type(e).__name__}: {e}). "
+            "Файл повреждён или это не аудио — попробуй перекодировать в mp3 и прислать снова.")
+
+    buf = io.BytesIO()
+    audio_seg.export(buf, format="mp3", bitrate="192k")
+    audio_bytes = buf.getvalue()
+    if not audio_bytes:
+        raise ValueError("Аудио после перекодирования оказалось пустым — файл повреждён.")
+    ext = ".mp3"
+    mime_type = "audio/mpeg"
+
+    unique_name = f"tg_{uuid.uuid4().hex[:12]}{ext}"
+    files = {'image': (unique_name, audio_bytes, mime_type)}   # endpoint общий, поле всегда 'image'
+    try:
+        response = requests.post(f"{COMFY_URL}/upload/image", files=files, timeout=120)
+    except requests.exceptions.RequestException as e:
+        print(f"ComfyUI: ошибка загрузки аудио: {e}")
+        return None
+    if response.status_code == 200:
+        data = response.json()
+        if data.get('subfolder'):
+            return f"{data['subfolder']}/{data['name']}"
+        return data['name']
+    print(f"ComfyUI: загрузка аудио вернула HTTP {response.status_code}: {response.text[:200]}")
+    return None
+
 # --- Буфер альбомов (Telegram шлёт альбом как N сообщений с общим media_group_id) ---
 album_buffer: dict = {}  # (chat_id, media_group_id) -> {"messages": [], "task": ...}
 
@@ -1503,7 +1618,11 @@ async def process_photo_edit(photo_messages: list, caption: str):
 
             photo_bytes = await asyncio.to_thread(wait_comfy_result, prompt_id)
             await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(photo_bytes, filename="comfy_edit.png"), message_thread_id=thread_id)
-            await first.answer(f"📝 Промт:\n\n{detailed_prompt}\n\n🖼 Картинок: {n_images} | 🌱 Seed: {used_seed}")
+            # send_message_safe: у detailed_prompt могут быть _ * ` — при ошибке
+            # разметки текст уйдёт без Markdown, но дойдёт целиком
+            await send_message_safe(bot, chat_id,
+                                    f"📝 Промт:\n\n{detailed_prompt}\n\n🖼 Картинок: {n_images} | 🌱 Seed: {used_seed}",
+                                    message_thread_id=thread_id)
         else:
             status_msg = await first.answer("⌛ Идёт генерация картинки (может занять до 10 мин)...")
 
@@ -1522,7 +1641,10 @@ async def process_photo_edit(photo_messages: list, caption: str):
             if path:
                 path = upload_to_imgbb(None, path, chat_id, thread_id)
                 await bot.send_photo(chat_id=chat_id, photo=path, message_thread_id=thread_id)
-                await first.answer(f"📝 **Промт:**\n\n`{detailed_prompt}`")
+                # send_message_safe: ` вокруг промта + _ внутри промта = ошибка
+                # разметки; тут ступень 0 отформатирует, а при ошибке — повтор без Markdown
+                await send_message_safe(bot, chat_id, f"📝 **Промт:**\n\n`{detailed_prompt}`",
+                                        message_thread_id=thread_id)
         print('Готово!')
 
     except Exception as e:
@@ -2403,6 +2525,228 @@ async def handle_music_generation(message: aiogram_types.Message):
     finally:
         if status_msg:
             await status_msg.delete()
+
+# ================== MUSIC-2-MUSIC И СЛУШАНИЕ MP3 ==================
+
+def _is_audio_media(message: aiogram_types.Message) -> bool:
+    """Аудиосообщение: message.audio или аудиофайл документом (mp3 и т.п.).
+    Голосовые (voice) сюда не входят — у них отдельный хендлер."""
+    if message.audio:
+        return True
+    return bool(message.document and (message.document.mime_type or "").startswith("audio/"))
+
+def _get_audio_media(message: aiogram_types.Message):
+    """(объект файла, mime_type, имя файла) для аудиосообщения; иначе (None, None, None)."""
+    if message.audio:
+        obj = message.audio
+        return obj, (obj.mime_type or "audio/mpeg"), (obj.file_name or None)
+    if message.document and (message.document.mime_type or "").startswith("audio/"):
+        obj = message.document
+        return obj, (obj.mime_type or "audio/mpeg"), (obj.file_name or None)
+    return None, None, None
+
+# --- Аудио для Gemini: ужатая версия (ComfyUI всегда получает оригинал) ---
+GEMINI_AUDIO_SAMPLE_RATE = 24000   # Гц — хватает, чтобы услышать стиль и разобрать слова
+GEMINI_AUDIO_BITRATE = "64k"       # битрейт ужатого mp3 (моно) — примерно 0.5 МБ на минуту
+
+def _compress_audio_for_gemini(audio_bytes: bytes, mime_type: str = "audio/mpeg"):
+    """Сжимает трек для отправки в Gemini: моно, 24 кГц, mp3 64k.
+    Gemini нужен трек только чтобы ПОСЛУШАТЬ его, поэтому качество можно просадить —
+    base64-полезная нагрузка уменьшается в разы. В ComfyUI уходит оригинал без изменений.
+    Возвращает (bytes, mime_type); если сжать не вышло или ужатая версия вышла крупнее —
+    возвращает оригинал как есть."""
+    try:
+        seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+        seg = seg.set_channels(1).set_frame_rate(GEMINI_AUDIO_SAMPLE_RATE)
+        buf = io.BytesIO()
+        seg.export(buf, format="mp3", bitrate=GEMINI_AUDIO_BITRATE)
+        compressed = buf.getvalue()
+        if compressed and len(compressed) < len(audio_bytes):
+            print(f"🎧 Аудио для Gemini ужато: {len(audio_bytes) // 1024} КБ -> {len(compressed) // 1024} КБ")
+            return compressed, "audio/mpeg"
+    except Exception as e:
+        print(f"⚠️ Аудио для Gemini не ужалось ({type(e).__name__}: {e}), отправляю оригинал.")
+    return audio_bytes, mime_type
+
+class CaptionWordsFilter(Filter):
+    """Все перечисленные слова должны быть отдельными словами в подписи к медиа
+    (аналог ExactWordsFilter, но для caption)."""
+
+    def __init__(self, *words: str):
+        self.words = [w.lower() for w in words]
+
+    async def __call__(self, message: aiogram_types.Message) -> bool:
+        if not message.caption:
+            return False
+        caption_words = re.findall(r'[а-яёa-z0-9]+', message.caption.lower())
+        return all(word in caption_words for word in self.words)
+
+@main_router.message(_is_audio_media, CaptionWordsFilter(f'{CHAT_TRIGGER_WORD}', MUSIC_TRIGGER_COMMAND))
+async def handle_music_2_music(message: aiogram_types.Message):
+    """music-2-music: mp3 + подпись «пупс спой [что изменить] [str=X]».
+    Gemini слушает УЖАТУЮ версию трека и переписывает запрос в TAGS + LYRICS,
+    ComfyUI (ACE-Step) получает оригинал и перегенерирует трек с lyrics_strength.
+    Регистрируется ДО handle_audio_listener: сначала проверяется генерация."""
+    user_name = message.from_user.full_name
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    status_msg = None
+
+    raw_caption = (message.caption or "").lower()
+    cleaned_caption, user_seed = extract_seed(raw_caption)
+    cleaned_caption, lyrics_strength = extract_lyrics_strength(cleaned_caption)
+    request_text = cleaned_caption.replace(CHAT_TRIGGER_WORD, '', 1).replace(MUSIC_TRIGGER_COMMAND, '', 1).strip()
+    prompt_text = f'{user_name}: {request_text}'
+
+    if not request_text:
+        await message.reply(
+            f"⚠️ {CHAT_TRIGGER_WORD.capitalize()} не понял, что делать с треком. Напиши запрос после команды, "
+            f"например: `{CHAT_TRIGGER_WORD} {MUSIC_TRIGGER_COMMAND} переделай в драм-н-бейс, слова оставь str=1.5`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        comfy_online = await asyncio.to_thread(is_comfyui_online)
+        if not comfy_online:
+            await message.reply(f"🖥❌ Генератор временно отключён, попробуй позже.")
+            return
+
+        # 1. Скачиваем исходный трек (лимит Телеги для ботов — 20 МБ)
+        audio_obj, mime_type, file_name = _get_audio_media(message)
+        if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
+            await message.reply("❌ Файл слишком большой! Telegram разрешает ботам скачивать файлы только до 20 МБ.")
+            return
+
+        print('Загрузка исходного трека...')
+        file_info = await bot.get_file(audio_obj.file_id)
+        file_bytes_io = await bot.download_file(file_info.file_path, timeout=600)
+        file_bytes_io.seek(0)
+        audio_bytes = file_bytes_io.read()
+        if not audio_bytes:
+            raise ValueError("Скачанный аудиофайл оказался пустым (0 байт).")
+
+        # Длительность исходника — она же будет длительностью результата
+        try:
+            source_duration = len(AudioSegment.from_file(io.BytesIO(audio_bytes))) // 1000
+        except Exception:
+            source_duration = None
+
+        # 2. Gemini слушает УЖАТУЮ версию трека и улучшает промт -> TAGS / LYRICS
+        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+        gemini_bytes, gemini_mime = await asyncio.to_thread(_compress_audio_for_gemini, audio_bytes, mime_type)
+        encoded_audio = base64.b64encode(gemini_bytes).decode('utf-8')
+        user_key = load_gemini_user_key(user_id)
+        active_key = user_key if user_key else API_KEY_GEMINI
+        music_prompt_raw = await gemini_priem_audio(chat_id, prompt_text, encoded_audio,
+                                                    mime_type=gemini_mime, user_key=active_key,
+                                                    system_prompt=MUSIC_M2M_PROMPT)
+        tags, lyrics = _parse_music_prompt(music_prompt_raw)
+        print(f"🎧 M2M промт: TAGS={tags!r} | LYRICS={lyrics[:80]!r}...")
+
+        # 3. В ComfyUI уходит ОРИГИНАЛ трека (Gemini получал только ужатую версию)
+        audio_filename = await asyncio.to_thread(upload_audio_to_comfy, audio_bytes, mime_type, file_name)
+        if not audio_filename:
+            raise RuntimeError("ComfyUI: не удалось загрузить исходный трек.")
+
+        prompt_id, used_seed = await asyncio.to_thread(
+            submit_music_m2m_comfy, tags, lyrics, audio_filename, lyrics_strength, user_seed)
+        position, running = await asyncio.to_thread(get_comfy_queue_position, prompt_id)
+
+        status_msg = await message.answer(
+            f"⌛ Переделываю твой трек (lyrics_strength: {lyrics_strength}).\n"
+            f"{_format_queue_info(position, running)}Это надолго, жди..."
+        )
+        await bot.send_chat_action(chat_id, "upload_document", message_thread_id=thread_id)
+
+        print(f'Генерация музыки M2M (str={lyrics_strength})...')
+        audio_result = await asyncio.to_thread(wait_comfy_result, prompt_id)
+
+        await send_audio_to_chat(chat_id, thread_id, audio_result, duration=source_duration,
+                                 title=(tags.split(",")[0].strip()[:64] if tags else None),
+                                 performer=CHAT_TRIGGER_WORD.capitalize())
+
+        info_text = (f"🏷 Тэги:\n{tags or '—'}\n\n🎤 Лирика:\n{lyrics or '[Instrumental]'}\n\n"
+                     f"🎚 str: {lyrics_strength} | 🌱 Seed: {used_seed}")
+        await _send_chunks_safe(message, split_by_lines(info_text, max_length=4000))
+
+        print('Готово!')
+
+    except Exception as e:
+        print(e)
+        user_info = message.from_user.full_name
+        await send_log_to_telegram(f"{e}", "Music_M2M", chat_id, thread_id, user_info)
+    finally:
+        if status_msg:
+            await status_msg.delete()
+
+@main_router.message(_is_audio_media, lambda m: (
+    m.chat.type == ChatType.PRIVATE or (m.caption and f'{CHAT_TRIGGER_WORD}'.lower() in m.caption.lower())
+))
+async def handle_audio_listener(message: aiogram_types.Message):
+    """Бот СЛУШАЕТ mp3 (аудио/аудиодокумент) и отвечает по содержимому от лица Пупса.
+    В группах — только если в подписи есть слово «пупс», в личке — всегда.
+    Генерацию с «пупс спой ...» перехватывает хендлер handle_music_2_music выше."""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    user_name = message.from_user.full_name
+
+    user_text = message.caption or "Послушай этот трек и поделись впечатлениями"
+    text = f"{user_name}: {user_text}"
+
+    try:
+        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+
+        audio_obj, mime_type, _file_name = _get_audio_media(message)
+        if audio_obj.file_size and audio_obj.file_size > 20 * 1024 * 1024:
+            await message.reply("❌ Файл слишком большой! Telegram разрешает ботам скачивать файлы только до 20 МБ.")
+            return
+
+        print('Загрузка аудио (listener)...')
+        file_info = await bot.get_file(audio_obj.file_id)
+        file_bytes_io = await bot.download_file(file_info.file_path, timeout=600)
+        file_bytes_io.seek(0)
+        audio_bytes = file_bytes_io.read()
+        if not audio_bytes:
+            raise ValueError("Скачанный аудиофайл оказался пустым (0 байт).")
+
+        # Gemini тоже слушает ужатую версию — оригинал тут больше никому не нужен
+        gemini_bytes, gemini_mime = await asyncio.to_thread(_compress_audio_for_gemini, audio_bytes, mime_type)
+        encoded_audio = base64.b64encode(gemini_bytes).decode('utf-8')
+        user_key = load_gemini_user_key(user_id)
+        active_key = user_key if user_key else API_KEY_GEMINI
+        response = await gemini_priem_audio(chat_id, text, encoded_audio, mime_type=gemini_mime,
+                                            user_key=active_key, system_prompt=PROMPT)
+
+        try:
+            await send_message_safe(bot, chat_id, response, message_thread_id=thread_id,
+                                    reply_to_message_id=message.message_id)
+        except TelegramBadRequest as e:
+            # Ответ модели может содержать незакрытые _ * ` и [Verse 1] — Телега
+            # не парсит разметку. Повторяем с ЯВНЫМ parse_mode=None (дефолт
+            # MARKDOWN из DefaultBotProperties иначе подставится сам).
+            if "can't parse entities" not in str(e):
+                raise
+            print(f"⚠️ Ответ не прошёл из-за разметки, шлю без Markdown: {e}")
+            await bot.send_message(chat_id, response, message_thread_id=thread_id,
+                                   reply_to_message_id=message.message_id, parse_mode=None)
+
+        if is_summary_enabled(chat_id):
+            bot_name = CHAT_TRIGGER_WORD.capitalize()
+            log_data = get_chat_log(chat_id)
+            log_data.append({
+                "user": bot_name,
+                "text": response,
+                "time": time.strftime("%H:%M")
+            })
+            save_chat_log(chat_id, log_data)
+
+    except Exception as e:
+        error_details = f"{type(e).__name__}: {str(e)}" if str(e) else f"Неизвестное исключение {repr(e)}"
+        print(f"❌ Ошибка в handle_audio_listener: {error_details}")
+        await send_log_to_telegram(error_details, "Audio Listener", chat_id, thread_id, user_name)
             
 @main_router.message(F.text.lower().contains(f"{CHAT_TRIGGER_WORD} context"))
 async def handle_set_max_history(message: aiogram_types.Message):
